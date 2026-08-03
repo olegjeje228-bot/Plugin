@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using EventHUD.AntiAdm;
+using EventHUD.FpvDrone;
 using EventHUD.AntiDdos;
 using EventHUD.Backpack;
 using EventHUD.EventHandlers;
@@ -69,6 +70,7 @@ namespace EventHUD
         private BreakerGun breakerGun;
         private GrenadeLauncher grenadeLauncher;
         private GrenadeLauncherRp grenadeLauncherRp;
+        private FpvDroneItem _fpvDroneItem;
 
         public override void OnEnabled()
         {
@@ -275,6 +277,12 @@ namespace EventHUD
 
             SpecDebug.Log("СПЕЦ-АЙТЕМЫ зарегистрированы: 1 Ломатор, 3 Гранатомёт, 4 ГранатомётРП");
 
+            // ── FPV Drone system ──
+            FpvDroneSystem.Register();
+            _fpvDroneItem = new FpvDroneItem();
+            _fpvDroneItem.Register();
+            SpecDebug.Log("FPV DRONE registered: ID 6");
+
             base.OnEnabled();
         }
 
@@ -434,6 +442,9 @@ namespace EventHUD
             Norma?.Disable();
             Norma = null;
 
+            FpvDroneSystem.Unregister();
+            if (_fpvDroneItem != null) { _fpvDroneItem.Unregister(); _fpvDroneItem = null; }
+
             HudToggleService.Reset();
             HudNoticeService.Reset();
 
@@ -466,6 +477,7 @@ namespace EventHUD
             Rpm.FullRpState.ResetConfirmations();
             EventHUD.Commands.TeslaCommand.Reset();
             EventHUD.Commands.EscapeCommand.Reset();
+            FpvDroneSystem.Reset();
             AloneDummy?.Reset();
             ScpTeslaProtection?.OnRoundRestart();
             Bomba.BombaPlane.Reset();

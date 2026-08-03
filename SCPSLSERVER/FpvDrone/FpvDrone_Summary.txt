@@ -1,0 +1,211 @@
+========================================
+FPV DRONE SYSTEM - FULL IMPLEMENTATION
+========================================
+Project: EventHUD (SCPSLSERVER)
+Namespace: EventHUD.FpvDrone
+EXILED: 9.14.2
+Target: net48
+Build: PASS (0 errors)
+
+========================================
+FILES CREATED (4 files)
+========================================
+
+1. FpvDrone/DroneInstance.cs  (new)
+2. FpvDrone/FpvDroneSystem.cs (new)
+3. FpvDrone/FpvDroneItem.cs   (new)
+4. FpvDrone/DroneCommand.cs   (new)
+
+========================================
+FILE MODIFIED (1 file)
+========================================
+
+5. Plugin.cs (patched)
+
+========================================
+CHANGES TO Plugin.cs
+========================================
+
+--- ADD at top (after existing usings):
+using EventHUD.FpvDrone;
+
+--- ADD field (after grenadeLauncherRp):
+private FpvDroneItem _fpvDroneItem;
+
+--- ADD in OnEnabled() after SpecDebug.Log about spec items:
+// ── FPV Drone system ──
+FpvDroneSystem.Register();
+_fpvDroneItem = new FpvDroneItem();
+_fpvDroneItem.Register();
+SpecDebug.Log("FPV DRONE registered: ID 6");
+
+--- ADD in OnDisabled() before HudToggleService.Reset():
+FpvDroneSystem.Unregister();
+if (_fpvDroneItem != null) { _fpvDroneItem.Unregister(); _fpvDroneItem = null; }
+
+--- ADD in OnRoundStarted() after EscapeCommand.Reset():
+FpvDroneSystem.Reset();
+
+========================================
+FILE: FpvDrone/DroneInstance.cs
+========================================
+Purpose: Core drone logic - physics, piloting, camera, HUD, combat
+
+Key classes/fields:
+- DroneInstance (sealed class)
+  - Id, Owner, Pilot, Dummy, Schematic, SoundPlayer
+  - Position, Rotation, Velocity (Vector3 physics)
+  - BatteryVoltage (7.01V start), Hp (400), Ammo (5), IsActive/Piloting/Destroyed/Dropping
+  - OriginalRole/Position/Health/Inventory/Ammo (state save/restore)
+  - _selfDestructPresses, _confirmingDestruct (3-tap R)
+  - Physics constants: MaxHSpeed=33.3, Accel=15, Elasticity=0.35, G=9.81, Range=400
+
+Key methods:
+- StartPhysics() - begins physics + sound coroutines
+- StartPiloting(Player) - saves state, spawns dummy, enters camera, starts HUD/Cam loops
+- StopPiloting(bool restore) - kills coroutines, restores state, removes dummy
+- Destroy(bool explode) - kills everything, optional HE explosion
+- TakeDamage(float) - subtracts HP, destroys at 0
+- OnKey(id, pressed) - handles exit/drop/destruct keybinds
+- PhysicsLoop() - 0.05s tick: battery drain, input, movement, collision, ground, tesla
+- UpdateBat(float dt) - complex drain model based on movement/ammo
+- GetInput() - WASD+QE normalized vector
+- WallHit() - BoxCast collision with damage reflection
+- GroundCheck() - Raycast 0.15m
+- TeslaCheck() - GameObject.FindGameObjectsWithTag("TeslaGate")
+- DoorHit() - opens unsecured doors within 2m
+- HitPlayers() - ram damage to players
+- DropSeq() - drops all grenade payload
+- HudLoop() - broadcasts speed/battery/ammo every 0.2s
+- CamLoop() - sets pilot position/rotation at camera offset every 0.05s
+- SoundLoop() / MakeSound() - AudioPlayerApi via reflection
+- EnterCamera() - sets Tutorial, scale 0.0193, Invisible, NightVision, FogControl
+- RestoreState() - restores role, position, inventory, ammo
+- SpawnDummy() - Npc.Spawn with original items + radio
+- SyncSchem() / DestroySchem() / PlayAnim() - ProjectMER reflection
+
+========================================
+FILE: FpvDrone/FpvDroneSystem.cs
+========================================
+Purpose: Static manager - drone registry, SSS keybinds, event handlers
+
+Key constants (SSS keybind IDs):
+- KeyForward=6001 (W), KeyLeft=6002 (A), KeyBack=6003 (S), KeyRight=6004 (D)
+- KeyDown=6005 (Q), KeyUp=6006 (E)
+- KeyYawLeft=6007 (LeftArrow), KeyYawRight=6008 (RightArrow)
+- KeyDestruct=6009 (R), KeyExit=6010 (Mouse0), KeyDrop=6011 (Mouse1)
+
+Key methods:
+- Register() - subscribes to SSS/Shooting/Died/Left/RoundStarted
+- Unregister() - unsubscribes and destroys all
+- SpawnDrone(owner, pos, rot) - spawns ProjectMER schematic + creates DroneInstance
+- GetByOwner(Player) / GetByPilot(Player) - lookup
+- SendDroneKeybinds(Player) - SSS SendToPlayer
+- RestoreKeybinds(Player) - calls Hud.SssRoleSync.SyncPlayer after delay
+- ShowHitmarker(Player) - reflection-based Hitmarker.SendHitmarkerDirectly
+- ListDrones() - text report for RA command
+- SpawnSchematic(name, pos, rot) - reflection: ProjectMER.ObjectSpawner.TrySpawnSchematic
+
+Event handlers:
+- OnSetting - SSS keybind -> DrimeInstance.OnKey
+- OnShoot - player shoots drone -> damage
+- OnDied / OnLeft - cleanup
+- FindTarget - raycast check 200m range, 5度 angle
+
+========================================
+FILE: FpvDrone/FpvDroneItem.cs
+========================================
+Purpose: Custom item (Radio, ID 6) - FPV Drone Controller
+
+Attributes: [CustomItem(ItemType.Radio)]
+Extends: CustomItem
+
+Overrides:
+- Id=6, Name="FPV-DRONE", Weight=0.5
+- SpawnProperties with Limit=0 (admin only)
+- SubscribeEvents - subscribes to Player.UsingItem
+- UnsubscribeEvents - unsubscribes from Player.UsingItem
+- OnAcquired - spawns drone 3m in front of player after 0.5s delay (max 40 drones)
+- OnUsingItem (private) - cancels item use, activates piloting via
+  FpvDroneSystem.GetByOwner.StartPiloting (checks Check() for custom item)
+
+========================================
+FILE: FpvDrone/DroneCommand.cs
+========================================
+Purpose: RA command handler
+
+Command: "drone"
+Aliases: none
+Handler: RemoteAdminCommandHandler
+
+Subcommands:
+- drone give <player_id> - gives FPV-DRONE item
+- drone delete all - destroys all active drones
+- drone remove <player_id> - removes player's drone
+- drone list - lists all drones with status
+
+========================================
+EXTERNAL ASSETS NEEDED
+========================================
+
+1. Schematic: "fpv_дрон" (fpv_дрон.json) in ProjectMER schematics folder
+   - Must have animation "Flying" and "Dropping"
+   - Camera offset at local (0.3140654, 0.34165, 1.1101)
+   - Bomb drop offset at local (0.3167038, 0.3081999, 1.249203)
+
+2. Audio: "dron.ogg" (mono 48kHz Vorbis) in Configs/EventHUD/Audio/
+   - Looping engine sound clip
+
+========================================
+API REFERENCES USED
+========================================
+- Exiled 9.14.2 (ExMod.Exiled NuGet)
+- Exiled.Dev.References 1.0.4
+- AudioPlayerApi 1.1.3 (reflection: AudioPlayer.CreateOrGet)
+- ProjectMER (local DLL reference: ProjectMER.Features.ObjectSpawner.TrySpawnSchematic)
+- MEC (Timing.RunCoroutine, Timing.CallDelayed, Timing.KillCoroutines)
+- ServerSpecificSettings (SSKeybindSetting, ServerSpecificSettingsSync)
+- Harmony 2.3.3 (Lib.Harmony)
+
+========================================
+PHYSICS SPECS
+========================================
+- Tick: 0.05s (20 TPS)
+- HUD tick: 0.2s (5 TPS)
+- Max horizontal speed: 33.3 m/s (120 km/h)
+- Max vertical speed: 8 m/s
+- Horizontal acceleration: 15 m/s^2
+- Horizontal deceleration: 5 m/s^2
+- Yaw speed: 120 deg/s
+- Max forward tilt: 45 deg
+- Max sideways tilt: 30 deg
+- Tilt return speed: 90 deg/s
+- Bounce elasticity: 35%
+- Collision damage: 15 HP per m/s
+- Battery: 7.01V start, ~3 min flight
+- HP: 400
+- Ammo: 5 grenades
+- Range: 400m from pilot origin
+- Tesla kill radius: 4m
+- Wall hitbox: BoxCast (0.4, 0.07, 0.017)
+- Ground detection: Raycast 0.15m
+
+========================================
+FULL FILE CONTENTS (for Agent)
+========================================
+
+To create this system from scratch, the AI agent needs to:
+
+1. CREATE folder FpvDrone/ in the project root
+2. CREATE 4 .cs files with the content above
+3. PATCH Plugin.cs with the 4 changes listed
+4. Place external assets (schematic JSON + audio OGG)
+5. Build: dotnet build (should produce 0 errors)
+
+The code uses:
+- GameObject.FindGameObjectsWithTag("TeslaGate") for tesla proximity
+- GameObject.FindGameObjectsWithTag("Door") for door interaction
+- Npc.Spawn(name, roleType) for dummy (2 params, EXILED 9.x style)
+- Reflection for ProjectMER, AudioPlayerApi, Hitmarker
+- MEC coroutines for async loops
+- SSS keybinds for drone controls
