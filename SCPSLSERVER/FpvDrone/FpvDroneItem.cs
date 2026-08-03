@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using Exiled.API.Features;
 using Exiled.API.Features.Attributes;
+using Exiled.API.Features.Items;
 using Exiled.API.Features.Spawn;
 using Exiled.CustomItems.API.Features;
 using Exiled.Events.EventArgs.Player;
@@ -35,19 +36,16 @@ namespace EventHUD.FpvDrone
             base.UnsubscribeEvents();
         }
 
-        protected override void OnAcquired(Player player, Exiled.API.Features.Items.Item item, bool displayMessage)
+        protected override void OnAcquired(Player player, Item item, bool displayMessage)
         {
             base.OnAcquired(player, item, displayMessage);
 
-            if (player == null || item == null)
+            if (player == null || item == null || !Check(item))
                 return;
 
             Timing.CallDelayed(0.5f, () =>
             {
                 if (player == null || !player.IsConnected || !player.IsAlive)
-                    return;
-
-                if (!Check(item))
                     return;
 
                 if (FpvDroneSystem.GetByOwner(player) != null)
@@ -60,13 +58,24 @@ namespace EventHUD.FpvDrone
                 Vector3 direction = player.CameraTransform.forward.normalized;
                 Vector3 spawnPosition = origin + direction * 3f;
 
-                if (Physics.Raycast(origin, direction, out RaycastHit wallHit, 3.5f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                if (Physics.Raycast(origin, direction, out RaycastHit wallHit, 3.5f,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                {
                     spawnPosition = wallHit.point - direction * 0.5f;
+                }
 
-                if (Physics.Raycast(spawnPosition + Vector3.up * 2f, Vector3.down, out RaycastHit floorHit, 10f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                if (Physics.Raycast(spawnPosition + Vector3.up * 2f, Vector3.down,
+                    out RaycastHit floorHit, 10f, Physics.DefaultRaycastLayers,
+                    QueryTriggerInteraction.Ignore))
+                {
                     spawnPosition.y = floorHit.point.y + 0.2f;
+                }
 
-                Quaternion rotation = Quaternion.Euler(0f, player.CameraTransform.eulerAngles.y, 0f);
+                Quaternion rotation = Quaternion.Euler(
+                    0f,
+                    player.CameraTransform.eulerAngles.y,
+                    0f);
+
                 FpvDroneSystem.SpawnDrone(player, spawnPosition, rotation);
             });
         }
