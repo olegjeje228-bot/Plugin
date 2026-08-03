@@ -28,6 +28,7 @@ namespace EventHUD.FpvDrone
         public const int KeyDrop = 6011;
 
         private static readonly List<ServerSpecificSettingBase> KB = new List<ServerSpecificSettingBase>();
+        private static readonly Dictionary<string, DateTime> LastKeyEvents = new Dictionary<string, DateTime>();
 
         public static void Register()
         {
@@ -59,10 +60,10 @@ namespace EventHUD.FpvDrone
             Exiled.Events.Handlers.Player.Died -= OnDied;
             Exiled.Events.Handlers.Player.Left -= OnLeft;
             Exiled.Events.Handlers.Server.RoundStarted -= OnRound;
-            DestroyAll(); KB.Clear();
+            DestroyAll(); KB.Clear(); LastKeyEvents.Clear();
         }
 
-        public static void Reset() { DestroyAll(); _nextId = 1; }
+        public static void Reset() { DestroyAll(); _nextId = 1; LastKeyEvents.Clear(); }
 
         public static DroneInstance SpawnDrone(Player owner, Vector3 pos, Quaternion rot)
         {
@@ -83,6 +84,11 @@ namespace EventHUD.FpvDrone
             if (Drones.Count == 0) return "No active drones.";
             return string.Join("\n", Drones.Where(d => !d.IsDestroyed).Select(d =>
                 $"#{d.Id} Owner:{d.Owner?.Nickname ?? "?"} HP:{d.Hp:0} Bat:{d.BatteryVoltage:0.00}V Pilot:{(d.IsPiloting ? d.Pilot?.Nickname : "-")}"));
+        }
+
+        public static IReadOnlyCollection<ServerSpecificSettingBase> GetSettings()
+        {
+            return KB;
         }
 
         public static void SendDroneKeybinds(Player p)
@@ -111,13 +117,31 @@ namespace EventHUD.FpvDrone
             }
         }
 
-        private static void OnSetting(ReferenceHub hub, ServerSpecificSettingBase s)
+        private static void OnSetting(ReferenceHub hub, ServerSpecificSettingBase setting)
         {
-            if (!(s is SSKeybindSetting kb)) return;
-            if (kb.SettingId < KeyForward || kb.SettingId > KeyDrop) return;
-            Player p = Player.Get(hub); if (p == null) return;
-            var d = GetByPilot(p); if (d == null) return;
-            d.OnKey(kb.SettingId, kb.SyncIsPressed);
+            if (!(setting is SSKeybindSetting keybind))
+                return;
+
+            if (keybind.SettingId < KeyForward || keybind.SettingId > KeyDrop)
+                return;
+
+            Player player = Player.Get(hub);
+            if (player == null || !player.IsConnected || !player.IsAlive)
+                return;
+
+            DroneInstance drone = GetByPilot(player);
+            if (drone == null || drone.IsDestroyed || !drone.IsPiloting)
+                return;
+
+            string eventKey = player.UserId + ":" + keybind.SettingId + ":" + keybind.SyncIsPressed;
+            DateTime now = DateTime.UtcNow;
+
+            if (LastKeyEvents.TryGetValue(eventKey, out DateTime previous) &&
+                (now - previous).TotalMilliseconds < 80d)
+                return;
+
+            LastKeyEvents[eventKey] = now;
+            drone.OnKey(keybind.SettingId, keybind.SyncIsPressed);
         }
 
         private static void OnShoot(Exiled.Events.EventArgs.Player.ShootingEventArgs ev)

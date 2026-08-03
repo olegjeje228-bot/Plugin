@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using EventHUD.FpvDrone;
 using EventHUD.Scp;
 using Exiled.API.Features;
 using MEC;
@@ -75,6 +76,7 @@ namespace EventHUD.Hud
             AddUnique(all, Scp106Settings);
             AddUnique(all, ScpSettings);
             AddUnique(all, TripwireSettings);
+            AddUnique(all, FpvDroneSystem.GetSettings());
 
             ServerSpecificSettingsSync.DefinedSettings =
                 all.ToArray();

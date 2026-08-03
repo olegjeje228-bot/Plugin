@@ -17,10 +17,11 @@ FILES CREATED (4 files)
 4. FpvDrone/DroneCommand.cs   (new)
 
 ========================================
-FILE MODIFIED (1 file)
+FILE MODIFIED (2 files)
 ========================================
 
 5. Plugin.cs (patched)
+6. Hud/SssRoleSync.cs (patched - FPV settings in DefinedSettings)
 
 ========================================
 CHANGES TO Plugin.cs
@@ -45,6 +46,19 @@ if (_fpvDroneItem != null) { _fpvDroneItem.Unregister(); _fpvDroneItem = null; }
 
 --- ADD in OnRoundStarted() after EscapeCommand.Reset():
 FpvDroneSystem.Reset();
+
+========================================
+CHANGES TO Hud/SssRoleSync.cs
+========================================
+
+--- ADD using:
+using EventHUD.FpvDrone;
+
+--- ADD in RebuildDefinedSettings() after AddUnique(all, TripwireSettings):
+AddUnique(all, FpvDroneSystem.GetSettings());
+
+This makes the drone SSS keybind settings visible to DefinedSettings
+so the server/clients know about the same setting objects/IDs.
 
 ========================================
 FILE: FpvDrone/DroneInstance.cs
@@ -73,7 +87,7 @@ Key methods:
 - WallHit() - BoxCast collision with damage reflection
 - GroundCheck() - Raycast 0.15m
 - TeslaCheck() - GameObject.FindGameObjectsWithTag("TeslaGate")
-- DoorHit() - opens unsecured doors within 2m
+- DoorHit() - opens doors within 2m (reflects _requiredPermissions field)
 - HitPlayers() - ram damage to players
 - DropSeq() - drops all grenade payload
 - HudLoop() - broadcasts speed/battery/ammo every 0.2s
@@ -97,9 +111,12 @@ Key constants (SSS keybind IDs):
 
 Key methods:
 - Register() - subscribes to SSS/Shooting/Died/Left/RoundStarted
-- Unregister() - unsubscribes and destroys all
+- Unregister() - unsubscribes, destroys all, clears KB + LastKeyEvents
+- Reset() - destroys all, resets _nextId, clears LastKeyEvents
 - SpawnDrone(owner, pos, rot) - spawns ProjectMER schematic + creates DroneInstance
 - GetByOwner(Player) / GetByPilot(Player) - lookup
+- GetSettings() -> IReadOnlyCollection<ServerSpecificSettingBase> (KB) -
+  integrated into SssRoleSync.RebuildDefinedSettings
 - SendDroneKeybinds(Player) - SSS SendToPlayer
 - RestoreKeybinds(Player) - calls Hud.SssRoleSync.SyncPlayer after delay
 - ShowHitmarker(Player) - reflection-based Hitmarker.SendHitmarkerDirectly
@@ -107,10 +124,14 @@ Key methods:
 - SpawnSchematic(name, pos, rot) - reflection: ProjectMER.ObjectSpawner.TrySpawnSchematic
 
 Event handlers:
-- OnSetting - SSS keybind -> DrimeInstance.OnKey
+- OnSetting - SSS keybind -> DroneInstance.OnKey
+  - Per-key debounce (80ms) via LastKeyEvents dictionary keyed by
+    UserId:SettingId:IsPressed
+  - Only processes when drone IsPiloting
+  - Prevents single physical press from firing twice (Mouse0/R/Mouse1)
 - OnShoot - player shoots drone -> damage
 - OnDied / OnLeft - cleanup
-- FindTarget - raycast check 200m range, 5度 angle
+- FindTarget - raycast check 200m range, 5 deg angle
 
 ========================================
 FILE: FpvDrone/FpvDroneItem.cs
@@ -120,14 +141,27 @@ Purpose: Custom item (Radio, ID 6) - FPV Drone Controller
 Attributes: [CustomItem(ItemType.Radio)]
 Extends: CustomItem
 
+IMPORTANT BUILD GOTCHA:
+- MUST include `using Exiled.API.Features.Attributes;`
+  Without it, [CustomItem] resolves to the abstract base class `CustomItem`
+  -> CS0653 "Cannot apply attribute class 'CustomItem' because it is abstract"
+
 Overrides:
 - Id=6, Name="FPV-DRONE", Weight=0.5
 - SpawnProperties with Limit=0 (admin only)
-- SubscribeEvents - subscribes to Player.UsingItem
+- SubscribeEvents - subscribes to Player.UsingItem (EXACTLY ONCE)
 - UnsubscribeEvents - unsubscribes from Player.UsingItem
-- OnAcquired - spawns drone 3m in front of player after 0.5s delay (max 40 drones)
-- OnUsingItem (private) - cancels item use, activates piloting via
-  FpvDroneSystem.GetByOwner.StartPiloting (checks Check() for custom item)
+- OnAcquired - spawns drone 3m in front of player after 0.5s delay
+  - Guard: player alive, Check(item) (so vanilla radio cannot create drone),
+    no existing owner drone, max 40 drones
+  - Physics.Raycast with Physics.DefaultRaycastLayers + QueryTriggerInteraction.Ignore
+- OnUsingItem (private) - uses ev.Item NOT ev.Player.CurrentItem
+  (avoids timing race where CurrentItem may have changed)
+  - Sets ev.IsAllowed=false (prevents normal radio use from consuming click)
+  - If drone.IsPiloting -> StopPiloting(true) (exit drone, restore state)
+  - Else if within 400m -> StartPiloting (enter drone)
+  - Subscribed via SubscribeEvents ONLY - do NOT subscribe in Plugin.cs
+    globally, or one click activates twice.
 
 ========================================
 FILE: FpvDrone/DroneCommand.cs
@@ -196,11 +230,28 @@ FULL FILE CONTENTS (for Agent)
 
 To create this system from scratch, the AI agent needs to:
 
-1. CREATE folder FpvDrone/ in the project root
-2. CREATE 4 .cs files with the content above
-3. PATCH Plugin.cs with the 4 changes listed
+1. CREATE folder FpvDrone/ in the project root (4 .cs files)
+2. PATCH Plugin.cs with the 4 changes listed
+3. PATCH Hud/SssRoleSync.cs:
+   - add `using EventHUD.FpvDrone;`
+   - in RebuildDefinedSettings() add `AddUnique(all, FpvDroneSystem.GetSettings());`
 4. Place external assets (schematic JSON + audio OGG)
 5. Build: dotnet build (should produce 0 errors)
+
+IMPORTANT - FpvDroneItem.cs build gotcha:
+- MUST have `using Exiled.API.Features.Attributes;` or [CustomItem] resolves
+  to the abstract base class `CustomItem` (CS0653). The web-agent's version
+  omitted this import and caused a build error.
+
+IMPORTANT - registration:
+- Plugin.cs DOES contain FpvDroneSystem.Register()/Unregister()/Reset()
+  and _fpvDroneItem registration. If the GitHub repo lacks it, the running
+  server is using a stale DLL. Verify server log:
+  "FPV DRONE registered: ID 6"
+- FpvDroneItem subscribes to Player.UsingItem once via SubscribeEvents().
+  Do NOT also subscribe globally in Plugin.cs (duplicate activation).
+- FpvDroneSystem.OnSetting has 80ms per-key debounce via LastKeyEvents,
+  keyed by UserId:SettingId:IsPressed.
 
 The code uses:
 - GameObject.FindGameObjectsWithTag("TeslaGate") for tesla proximity
