@@ -37,6 +37,9 @@ namespace EventHUD.Bomba
 
         private static readonly System.Random Rng = new System.Random();
 
+        // максимум активных самолётов одновременно (защита от ресурсного исчерпания)
+        private const int MaxPlanes = 10;
+
         public static int ActiveCount => Planes.Count;
 
         // ── Публичные методы для контроллера ──
@@ -93,6 +96,10 @@ namespace EventHUD.Bomba
             if (cfg == null)
                 return 0;
 
+            // защита от ресурсного исчерпания - не больше MaxPlanes самолётов одновременно
+            if (Planes.Count >= MaxPlanes)
+                return 0;
+
             Vector3 start = admin.Position + direction * 10f + Vector3.up * 5f;
             Vector3 dir = direction.normalized;
 
@@ -134,6 +141,10 @@ namespace EventHUD.Bomba
         {
             var cfg = Plugin.Instance?.Config;
             if (cfg == null)
+                return 0;
+
+            // защита от ресурсного исчерпания - не больше MaxPlanes самолётов одновременно
+            if (Planes.Count >= MaxPlanes)
                 return 0;
 
             // Самолёт повёрнут боком, доворачиваем на 90 вправо (как в Spawn)
