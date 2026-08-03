@@ -1,0 +1,5 @@
+C:\Users\tkanu\Music\SCPSLSERVER\obj\Release\net48\SCPSLSERVER.csproj.AssemblyReference.cache
+C:\Users\tkanu\Music\SCPSLSERVER\obj\Release\net48\SCPSLSERVER.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\tkanu\Music\SCPSLSERVER\obj\Release\net48\SCPSLSERVER.AssemblyInfoInputs.cache
+C:\Users\tkanu\Music\SCPSLSERVER\obj\Release\net48\SCPSLSERVER.AssemblyInfo.cs
+C:\Users\tkanu\Music\SCPSLSERVER\obj\Release\net48\SCPSLSERVER.csproj.CoreCompileInputs.cache

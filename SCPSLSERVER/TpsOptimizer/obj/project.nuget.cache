@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "dgSpecHash": "rQaUtf4zk2w=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\tkanu\\Music\\SCPSLSERVER\\TpsOptimizer\\TpsOptimizer.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\tkanu\\.nuget\\packages\\exiled.dev.references\\1.0.4\\exiled.dev.references.1.0.4.nupkg.sha512",
+    "C:\\Users\\tkanu\\.nuget\\packages\\exmod.exiled\\9.14.2\\exmod.exiled.9.14.2.nupkg.sha512"
+  ],
+  "logs": [
+    {
+      "code": "NU1900",
+      "level": "Warning",
+      "message": "Error occurred while getting package vulnerability data: Unable to load the service index for source https://api.nuget.org/v3/index.json.",
+      "projectPath": "C:\\Users\\tkanu\\Music\\SCPSLSERVER\\TpsOptimizer\\TpsOptimizer.csproj",
+      "warningLevel": 1,
+      "filePath": "C:\\Users\\tkanu\\Music\\SCPSLSERVER\\TpsOptimizer\\TpsOptimizer.csproj",
+      "targetGraphs": []
+    }
+  ]
+}
