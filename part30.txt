@@ -1,0 +1,679 @@
+acker);
+
+            if (angle < 60f)  return 1.0f;
+            if (angle < 120f) return 0.7f;
+            return 0.4f;
+        }
+
+        // ═══════════════════════════════════════
+        // SCP урон
+        // ═══════════════════════════════════════
+
+        private static float GetScpArmorDamage(ArmorType armor, DamageType scpType)
+        {
+            return (armor, scpType) switch
+            {
+                (_, DamageType.Scp0492) => 1f,
+                (ArmorType.Tank, DamageType.Scp939) => 2f,
+                (_, DamageType.Scp939) => 3f,
+                (ArmorType.Light, DamageType.Scp3114) => 5f,
+                (ArmorType.Combat, DamageType.Scp3114) => 3f,
+                (ArmorType.Heavy, DamageType.Scp3114) => 2f,
+                (ArmorType.Tank, DamageType.Scp3114) => 1f,
+                (ArmorType.Light, DamageType.Jailbird) => 10f,
+                (ArmorType.Combat, DamageType.Jailbird) => 5f,
+                (ArmorType.Heavy, DamageType.Jailbird) => 3f,
+                (ArmorType.Tank, DamageType.Jailbird) => 2f,
+                _ => 999f
+            };
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\ArmorRemovalService.cs =====
+// FIXED for EXILED 9.14.2
+// Если у тебя namespace SCPSLSERVER — замени EventHUD -> SCPSLSERVER
+using System;
+using System.Collections.Generic;
+using Exiled.API.Enums;
+using Exiled.API.Features;
+using Exiled.API.Features.Items;
+using MEC;
+using UnityEngine;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Снятие пробитого бронежилета.
+    /// Самому: лёгкий 3с, боевой 4с, тяжёлый 6с, танковый 10с.
+    /// Другой человек помогает: время / 3.
+    /// </summary>
+    public class ArmorRemovalState
+    {
+        public bool IsRemoving;
+        public float Elapsed;
+        public float Duration;
+        public Player Helper; // null = сам снимает
+    }
+
+    public static class ArmorRemovalStorage
+    {
+        private static readonly Dictionary<string, ArmorRemovalState> _states = new();
+
+        public static ArmorRemovalState GetOrCreate(string userId)
+        {
+            if (!_states.TryGetValue(userId, out var s))
+            {
+                s = new ArmorRemovalState();
+                _states[userId] = s;
+            }
+            return s;
+        }
+
+        public static bool TryGet(string userId, out ArmorRemovalState s) =>
+            _states.TryGetValue(userId, out s);
+
+        public static void Remove(string userId)
+        {
+            if (string.IsNullOrEmpty(userId))
+                return;
+            _states.Remove(userId);
+        }
+        public static void ClearAll() => _states.Clear();
+    }
+
+    public static class ArmorRemovalHelper
+    {
+        public static float GetRemovalTime(ArmorType type, bool hasHelper)
+        {
+            float baseTime = type switch
+            {
+                ArmorType.Light => 3f,
+                ArmorType.Combat => 4f,
+                ArmorType.Heavy => 6f,
+                ArmorType.Tank => 10f,
+                _ => 2f
+            };
+            return hasHelper ? baseTime / 3f : baseTime;
+        }
+
+        public static void StartRemoval(Player victim, Player helper = null)
+        {
+            var armor = ArmorStorage.GetOrCreate(victim.UserId);
+            if (armor.Type == ArmorType.None)
+                return;
+
+            var removal = ArmorRemovalStorage.GetOrCreate(victim.UserId);
+            if (removal.IsRemoving)
+                return;
+
+            removal.IsRemoving = true;
+            removal.Elapsed = 0;
+            removal.Duration = GetRemovalTime(armor.Type, helper != null);
+            removal.Helper = helper;
+
+            Timing.RunCoroutine(RemovalCoroutine(victim, removal));
+        }
+
+        private static IEnumerator<float> RemovalCoroutine(Player victim, ArmorRemovalState state)
+        {
+            while (state.Elapsed < state.Duration)
+            {
+                yield return Timing.WaitForSeconds(0.5f);
+                state.Elapsed += 0.5f;
+
+                if (victim == null || !victim.IsAlive)
+                {
+                    state.IsRemoving = false;
+                    yield break;
+                }
+
+                if (state.Helper != null && (!state.Helper.IsAlive ||
+                    Vector3.Distance(victim.Position, state.Helper.Position) > 2f))
+                {
+                    state.Helper = null;
+                    var armor = ArmorStorage.GetOrCreate(victim.UserId);
+                    state.Duration = GetRemovalTime(armor.Type, false);
+                }
+            }
+
+            var armorState = ArmorStorage.GetOrCreate(victim.UserId);
+            armorState.Reset();
+
+            // Дропаем ванильный предмет брони
+            // EXILED 9: Player.Items = IEnumerable<Item>, Item.Type = ItemType
+            foreach (Item item in victim.Items)
+            {
+                if (item.Type == ItemType.ArmorLight ||
+                    item.Type == ItemType.ArmorCombat ||
+                    item.Type == ItemType.ArmorHeavy)
+                {
+                    victim.RemoveItem(item);
+                    break;
+                }
+            }
+
+            state.IsRemoving = false;
+            ArmorRemovalStorage.Remove(victim.UserId);
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\ArmorState.cs =====
+using System;
+using System.Collections.Generic;
+
+namespace EventHUD.Medicine
+{
+    public class ArmorState
+    {
+        public ArmorType Type { get; set; } = ArmorType.None;
+
+        public float MaxDurability { get; set; }
+
+        public float Durability { get; set; }
+
+        public float BaseAbsorption { get; set; }
+
+        /// <summary>
+        /// 1 — отдельный лёгкий шлем цел.
+        /// 0 — шлем пробит.
+        /// Для обычных бронежилетов не используется.
+        /// </summary>
+        public int HelmetDurability { get; set; }
+
+        public List<DateTime> BodyStunStacks { get; } =
+            new List<DateTime>();
+
+        public bool HasAsphyxia { get; set; }
+
+        public bool HasLungBruise { get; set; }
+
+        public DateTime? Scp106TouchTime { get; set; }
+
+        public bool IsBroken
+        {
+            get
+            {
+                if (Type == ArmorType.Helmet)
+                    return HelmetDurability <= 0;
+
+                return Durability <= 0f;
+            }
+        }
+
+        public float EffectiveAbsorption
+        {
+            get
+            {
+                if (Type == ArmorType.Helmet || Durability <= 0f)
+                    return 0f;
+
+                if (MaxDurability <= 0f)
+                    return 0f;
+
+                float percentage = Durability / MaxDurability;
+
+                if (percentage > 0.7f)
+                    return BaseAbsorption;
+
+                if (percentage > 0.3f)
+                    return BaseAbsorption - 5f;
+
+                return BaseAbsorption - 15f;
+            }
+        }
+
+        public string DurabilityStatus
+        {
+            get
+            {
+                if (Type == ArmorType.Helmet)
+                {
+                    return HelmetDurability > 0
+                        ? "<color=#4CAF50>Цел</color>"
+                        : "<color=#F44336>Пробит</color>";
+                }
+
+                if (Durability <= 0f)
+                    return "<color=#FF0000>Разрушена</color>";
+
+                if (MaxDurability <= 0f)
+                    return "<color=#FF0000>Разрушена</color>";
+
+                float percentage = Durability / MaxDurability;
+
+                if (percentage > 0.7f)
+                    return "<color=#00FF00>Цела</color>";
+
+                if (percentage > 0.3f)
+                    return "<color=#FFAA00>Повреждена</color>";
+
+                return "<color=#FF4444>Критическая</color>";
+            }
+        }
+
+        public void CleanExpiredStacks()
+        {
+            DateTime now = DateTime.UtcNow;
+
+            BodyStunStacks.RemoveAll(
+                timestamp => (now - timestamp).TotalSeconds >= 10.0);
+
+            if (BodyStunStacks.Count < 4)
+                HasLungBruise = false;
+
+            if (BodyStunStacks.Count < 5)
+                HasAsphyxia = false;
+        }
+
+        public int ActiveStacks
+        {
+            get
+            {
+                CleanExpiredStacks();
+                return BodyStunStacks.Count;
+            }
+        }
+
+        public void AddStun()
+        {
+            BodyStunStacks.Add(DateTime.UtcNow);
+
+            if (ActiveStacks >= 5)
+                HasAsphyxia = true;
+            else if (ActiveStacks >= 4)
+                HasLungBruise = true;
+        }
+
+        public void Reset()
+        {
+            Type = ArmorType.None;
+            MaxDurability = 0f;
+            Durability = 0f;
+            BaseAbsorption = 0f;
+            HelmetDurability = 0;
+
+            BodyStunStacks.Clear();
+
+            HasAsphyxia = false;
+            HasLungBruise = false;
+            Scp106TouchTime = null;
+        }
+
+        public void SetType(ArmorType type)
+        {
+            Type = type;
+            MaxDurability = type.GetMaxDurability();
+            Durability = MaxDurability;
+            BaseAbsorption = type.GetBaseAbsorption();
+            HelmetDurability = type == ArmorType.Helmet ? 1 : 0;
+        }
+    }
+
+    public static class ArmorStorage
+    {
+        private static readonly Dictionary<string, ArmorState> States =
+            new Dictionary<string, ArmorState>();
+
+        public static ArmorState GetOrCreate(string userId)
+        {
+            if (!States.TryGetValue(userId, out ArmorState state))
+            {
+                state = new ArmorState();
+                States[userId] = state;
+            }
+
+            return state;
+        }
+
+        public static bool TryGet(
+            string userId,
+            out ArmorState state)
+        {
+            return States.TryGetValue(userId, out state);
+        }
+
+        public static void Remove(string userId)
+        {
+            if (string.IsNullOrEmpty(userId))
+                return;
+            States.Remove(userId);
+        }
+
+        public static void ClearAll()
+        {
+            States.Clear();
+        }
+    }
+
+    public static class ArmorItemDurabilityStorage
+    {
+        private static readonly Dictionary<ushort, float> Durability =
+            new Dictionary<ushort, float>();
+
+        private static readonly Dictionary<ushort, int> HelmetDurability =
+            new Dictionary<ushort, int>();
+
+        public static void Set(
+            ushort serial,
+            float durability,
+            int helmetDurability)
+        {
+            Durability[serial] = durability;
+            HelmetDurability[serial] = helmetDurability;
+        }
+
+        // Оставлено для совместимости со старым кодом.
+        public static void Set(ushort serial, float durability)
+        {
+            Durability[serial] = durability;
+        }
+
+        public static bool TryGet(
+            ushort serial,
+            out float durability)
+        {
+            return Durability.TryGetValue(serial, out durability);
+        }
+
+        public static bool TryGetHelmetDurability(
+            ushort serial,
+            out int helmetDurability)
+        {
+            return HelmetDurability.TryGetValue(
+                serial,
+                out helmetDurability);
+        }
+
+        public static void ClearAll()
+        {
+            Durability.Clear();
+            HelmetDurability.Clear();
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\ArmorType.cs =====
+namespace EventHUD.Medicine
+{
+    public enum ArmorType
+    {
+        None,
+
+        /// <summary>
+        /// Отдельный лёгкий шлем. Защищает голову от одной
+        /// разрешённой пули и не защищает корпус.
+        /// </summary>
+        Helmet,
+
+        Light,
+        Combat,
+        Heavy,
+        Tank
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\ArmorTypeExtensions.cs =====
+namespace EventHUD.Medicine
+{
+    public static class ArmorTypeExtensions
+    {
+        public static string GetDisplayName(this ArmorType type)
+        {
+            return type switch
+            {
+                ArmorType.Helmet => "Лёгкий шлем",
+                ArmorType.Light => "Лёгкий",
+                ArmorType.Combat => "Боевой",
+                ArmorType.Heavy => "Тяжёлый",
+                ArmorType.Tank => "Танковый",
+                _ => "Нет"
+            };
+        }
+
+        public static float GetMaxDurability(this ArmorType type)
+        {
+            return type switch
+            {
+                // Шлем использует HelmetDurability, а не общую прочность.
+                ArmorType.Helmet => 1f,
+                ArmorType.Light => 30f,
+                ArmorType.Combat => 90f,
+                ArmorType.Heavy => 150f,
+                ArmorType.Tank => 210f,
+                _ => 0f
+            };
+        }
+
+        public static float GetBaseAbsorption(this ArmorType type)
+        {
+            return type switch
+            {
+                ArmorType.Helmet => 0f,
+                ArmorType.Light => 30f,
+                ArmorType.Combat => 45f,
+                ArmorType.Heavy => 60f,
+                ArmorType.Tank => 75f,
+                _ => 0f
+            };
+        }
+
+        public static float GetIntactDamageReduction(this ArmorType type)
+        {
+            return type switch
+            {
+                ArmorType.Helmet => 0f,
+                ArmorType.Light => 0.45f,
+                ArmorType.Combat => 0.62f,
+                ArmorType.Heavy => 0.78f,
+                ArmorType.Tank => 0.90f,
+                _ => 0f
+            };
+        }
+
+        public static float GetArmorShield(this ArmorType type)
+        {
+            return type switch
+            {
+                ArmorType.Helmet => 0f,
+                ArmorType.Light => 20f,
+                ArmorType.Combat => 40f,
+                ArmorType.Heavy => 60f,
+                ArmorType.Tank => 80f,
+                _ => 0f
+            };
+        }
+
+        public static float GetLimbMultiplier(this ArmorType type)
+        {
+            return type switch
+            {
+                ArmorType.Tank => 0.5f,
+                _ => 0f
+            };
+        }
+
+        public static bool HasHelmet(this ArmorType type)
+        {
+            return type switch
+            {
+                ArmorType.Helmet => true,
+                ArmorType.Combat => true,
+                ArmorType.Heavy => true,
+                ArmorType.Tank => true,
+                _ => false
+            };
+        }
+
+        public static float GetHelmetThreshold(this ArmorType type)
+        {
+            return type switch
+            {
+                // Для отдельного шлема порог не используется:
+                // он обрабатывается раньше общей логики.
+                ArmorType.Helmet => 0f,
+                ArmorType.Combat => 38f,
+                ArmorType.Heavy => 50f,
+                ArmorType.Tank => 20f,
+                _ => 0f
+            };
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\BodyPart.cs =====
+namespace EventHUD.Medicine
+{
+    public enum BodyPart
+    {
+        Head,
+        Neck,
+        Chest,
+        Abdomen,
+        Pelvis,
+        LeftArm,
+        RightArm,
+        LeftHand,
+        RightHand,
+        LeftLeg,
+        RightLeg
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\BodyPartExtensions.cs =====
+using PlayerStatsSystem;
+
+namespace EventHUD.Medicine
+{
+    public static class BodyPartExtensions
+    {
+        /// <summary>
+        /// Сокращённое название части тела для HUD.
+        /// </summary>
+        public static string GetShortName(this BodyPart part) => part switch
+        {
+            BodyPart.Head      => "гол.",
+            BodyPart.Neck      => "шея",
+            BodyPart.Chest     => "груд.",
+            BodyPart.Abdomen   => "жив.",
+            BodyPart.Pelvis    => "таз",
+            BodyPart.LeftArm   => "л.р.",
+            BodyPart.RightArm  => "пр.р.",
+            BodyPart.LeftHand  => "л.лад.",
+            BodyPart.RightHand => "пр.лад.",
+            BodyPart.LeftLeg   => "л.н.",
+            BodyPart.RightLeg  => "пр.н.",
+            _                  => "?"
+        };
+
+        /// <summary>
+        /// Полное название части тела.
+        /// </summary>
+        public static string GetFullName(this BodyPart part) => part switch
+        {
+            BodyPart.Head      => "Голова",
+            BodyPart.Neck      => "Шея",
+            BodyPart.Chest     => "Грудь",
+            BodyPart.Abdomen   => "Живот",
+            BodyPart.Pelvis    => "Таз",
+            BodyPart.LeftArm   => "Левая рука",
+            BodyPart.RightArm  => "Правая рука",
+            BodyPart.LeftHand  => "Левая ладонь",
+            BodyPart.RightHand => "Правая ладонь",
+            BodyPart.LeftLeg   => "Левая нога",
+            BodyPart.RightLeg  => "Правая нога",
+            _                  => "?"
+        };
+
+        /// <summary>
+        /// Является ли часть тела жизненно важной (для определения артериального кровотечения).
+        /// </summary>
+        public static bool IsVital(this BodyPart part) => part switch
+        {
+            BodyPart.Head    => true,
+            BodyPart.Neck    => true,
+            BodyPart.Chest   => true,
+            BodyPart.Abdomen => true,
+            _                => false
+        };
+
+        /// <summary>
+        /// Конвертация HitboxType из игры в наш BodyPart.
+        /// HitboxType: Headshot, Body, Limb — грубое деление.
+        /// Для более точного определения используем рандом по зонам.
+        /// </summary>
+        public static BodyPart FromHitbox(HitboxType hitbox)
+        {
+            switch (hitbox)
+            {
+                case HitboxType.Headshot:
+                    // Голова или шея — 70/30
+                    return UnityEngine.Random.value < 0.7f ? BodyPart.Head : BodyPart.Neck;
+
+                case HitboxType.Body:
+                    // Грудь 40%, Живот 30%, Таз 15%, Шея 15%
+                    float bodyRoll = UnityEngine.Random.value;
+                    if (bodyRoll < 0.40f) return BodyPart.Chest;
+                    if (bodyRoll < 0.70f) return BodyPart.Abdomen;
+                    if (bodyRoll < 0.85f) return BodyPart.Pelvis;
+                    return BodyPart.Neck;
+
+                case HitboxType.Limb:
+                default:
+                    // Руки 40%, Ноги 40%, Ладони 20%
+                    float limbRoll = UnityEngine.Random.value;
+                    if (limbRoll < 0.20f) return BodyPart.LeftArm;
+                    if (limbRoll < 0.40f) return BodyPart.RightArm;
+                    if (limbRoll < 0.50f) return BodyPart.LeftHand;
+                    if (limbRoll < 0.60f) return BodyPart.RightHand;
+                    if (limbRoll < 0.80f) return BodyPart.LeftLeg;
+                    return BodyPart.RightLeg;
+            }
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\BodyStunTickService.cs =====
+using System.Collections.Generic;
+using Exiled.API.Features;
+using MEC;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Тик-сервис для стаков контузии корпуса.
+    /// При 5+ стаках (асфиксия) — -2HP каждые 3 секунды.
+    /// </summary>
+    public class BodyStunTickService
+    {
+        private CoroutineHandle _handle;
+
+        public void Start() => _handle = Timing.RunCoroutine(TickLoop());
+        public void Stop() => Timing.KillCoroutines(_handle);
+
+        private IEnumerator<float> TickLoop()
+        {
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(3f);
+
+                if (!Rpm.RpModuleManager.Instance.IsEnabled(Rpm.RpModuleType.Medicine))
+                    continue;
+
+                foreach (var player in Player.List)
+                {
+                    if (!player.IsAlive)
+                        continue;
+
+                    if (!ArmorStorage.TryGet(player.UserId, out var armor))
+                        continue;
+
+                    if (!armor.HasAsphyxia)
+                        continue;
+
+                    // Проверяем что стаки ещё активны
+                    armo

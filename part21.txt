@@ -1,0 +1,657 @@
+          }
+
+            if (arg == "off")
+            {
+                _teslaEnabled = false;
+                response = "Tesla выключена.";
+                return true;
+            }
+
+            if (string.IsNullOrEmpty(arg))
+            {
+                _teslaEnabled = !_teslaEnabled;
+                response = _teslaEnabled ? "Tesla включена." : "Tesla выключена.";
+                return true;
+            }
+
+            response = "Использование: tesla [on/off]";
+            return false;
+        }
+
+        public static void Reset()
+        {
+            _teslaEnabled = true;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\TwoLifeCommand.cs =====
+using System;
+using CommandSystem;
+using EventHUD.Cube;
+using Exiled.API.Features;
+
+namespace EventHUD.Commands
+{
+    [CommandHandler(typeof(ClientCommandHandler))]
+    public class TwoLifeCommand : ICommand
+    {
+        public string Command => "2life";
+        public string[] Aliases => new[] { "secondlife", "2л" };
+        public string Description => ".2life - взять вторую жизнь (нужен SCP-500 в руках), .2life stat - статистика";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            Player player = Player.Get(sender);
+            if (player == null)
+            {
+                response = "Команда доступна только игрокам.";
+                return false;
+            }
+
+            if (SecondLifeSystem.Instance == null)
+            {
+                response = "Система второй жизни не запущена.";
+                return false;
+            }
+
+            if (arguments.Count >= 1)
+            {
+                string a = arguments.At(0).Trim().ToLowerInvariant();
+                if (a == "stat" || a == "стат")
+                {
+                    response = SecondLifeSystem.Instance.GetStat(player);
+                    return true;
+                }
+            }
+
+            return SecondLifeSystem.Instance.TryActivate(player, out response);
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\UpdateCommand.cs =====
+using System;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+using CommandSystem;
+using Exiled.API.Features;
+using Newtonsoft.Json;
+
+namespace EventHUD.Commands
+{
+    [CommandHandler(typeof(RemoteAdminCommandHandler))]
+    public class UpdateCommand : ICommand
+    {
+        public string Command => "update";
+        public string[] Aliases => Array.Empty<string>();
+        public string Description => string.Empty;
+
+        private static readonly (string Key, string Title, int Color)[] Types =
+        {
+            ("bug",     "🟥 Обнаружен баг",             0xE74C3C),
+            ("fixed",   "🟩 Баг пофикшен",              0x2ECC71),
+            ("update",  "🟦 Обновление",                0x3498DB),
+            ("events",  "⚙️ Обновление Events",         0x9B59B6),
+            ("discord", "🔷 Обновление дискорд канала", 0x5865F2),
+            ("tech",    "🛠 Технические работы",        0xF1C40F),
+        };
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            if (arguments.Count == 0)
+            {
+                response = "update <тип> <текст>";
+                return false;
+            }
+
+            string type = arguments.At(0).ToLowerInvariant();
+            string text = string.Join(" ", arguments.Skip(1));
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                response = "Текст не может быть пустым.";
+                return false;
+            }
+
+            var found = Types.FirstOrDefault(t => t.Key == type);
+            if (found.Key == null)
+            {
+                response = "Неизвестный тип. Доступные: bug, fixed, update, events, discord, tech";
+                return false;
+            }
+
+            string url = Plugin.Instance?.Config?.DiscordWebhookUrl;
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                response = "Webhook не задан.";
+                return false;
+            }
+
+            var payload = new
+            {
+                embeds = new object[]
+                {
+                    new
+                    {
+                        title = found.Title,
+                        description = text.Replace("\\n", "\n"),
+                        color = found.Color,
+                        footer = new { text = "Aceline Events" },
+                        timestamp = DateTime.UtcNow.ToString("o"),
+                    }
+                }
+            };
+
+            _ = PostAsync(url, payload);
+
+            response = "Обновление отправлено.";
+            return true;
+        }
+
+        private static async Task PostAsync(string url, object payload)
+        {
+            try
+            {
+                string json = JsonConvert.SerializeObject(payload);
+                using (var content = new StringContent(json, Encoding.UTF8, "application/json"))
+                using (var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) })
+                {
+                    var resp = await client.PostAsync(url, content).ConfigureAwait(false);
+                    if (!resp.IsSuccessStatusCode)
+                        Log.Warn($"[Update] Webhook HTTP {(int)resp.StatusCode}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"[Update] Webhook error: {ex.Message}");
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\Subcommands\PrepareCommand.cs =====
+using System;
+using System.Linq;
+using CommandSystem;
+using EventHUD.Extensions;
+
+namespace EventHUD.Commands.Subcommands
+{
+    public class PrepareCommand : ICommand
+    {
+        public string Command => "prepare";
+        public string[] Aliases => new[] { "prep" };
+        public string Description => "ev prepare <NRP/LRP/FUNRP/MRP/HRP/FRP> <название>";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            if (arguments.Count < 2)
+            {
+                response = "Использование: ev prepare <RP> <название ивента>";
+                return false;
+            }
+
+            if (!RPTypeExtensions.TryParse(arguments.At(0), out var rpType))
+            {
+                response = "Неверный тип RP. NRP/LRP/FUNRP/MRP/HRP/FRP";
+                return false;
+            }
+
+            string eventName = string.Join(" ", arguments.Skip(1));
+            int maxLen = Plugin.Instance.Config.MaxEventNameLength;
+
+            if (eventName.Length > maxLen)
+            {
+                response = $"Название ивента слишком длинное! Максимум {maxLen} символов (сейчас {eventName.Length}).";
+                return false;
+            }
+
+            EventManager.Instance.Prepare(eventName, rpType, sender);
+            response = $"Подготовка ивента запущена: {eventName} [{rpType.GetShortName()}]";
+            return true;
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\Subcommands\StartCommand.cs =====
+using System;
+using System.Linq;
+using CommandSystem;
+using EventHUD.Enums;
+using EventHUD.Extensions;
+using Exiled.API.Features;
+
+namespace EventHUD.Commands.Subcommands
+{
+    public class StartCommand : ICommand
+    {
+        public string   Command     => "start";
+        public string[] Aliases     => Array.Empty<string>();
+        public string   Description => "ev start [RP] [название]";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            Player  player    = Player.Get(sender);
+            RPType? rpType    = null;
+            string  eventName = null;
+
+            if (arguments.Count >= 1 && RPTypeExtensions.TryParse(arguments.At(0), out var parsed))
+            {
+                rpType = parsed;
+
+                if (arguments.Count >= 2)
+                {
+                    eventName = string.Join(" ", arguments.Skip(1));
+                    int maxLen = Plugin.Instance.Config.MaxEventNameLength;
+                    if (eventName.Length > maxLen)
+                    {
+                        response = $"Название слишком длинное! Максимум {maxLen} символов (сейчас {eventName.Length}).";
+                        return false;
+                    }
+                }
+            }
+
+            bool success = EventManager.Instance.Start(player, rpType, eventName, out string message);
+
+            // Засчитываем ивент в системе нормы
+            if (success && player != null)
+                Norma.NormaSystem.Instance?.AddEvent(player);
+
+            response = message;
+            return success;
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\Subcommands\StopCommand.cs =====
+using System;
+using CommandSystem;
+using Exiled.API.Features;
+
+namespace EventHUD.Commands.Subcommands
+{
+    public class StopCommand : ICommand
+    {
+        public string Command => "stop";
+        public string[] Aliases => Array.Empty<string>();
+        public string Description => "ev stop";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            Player player = Player.Get(sender);
+            bool success = EventManager.Instance.Stop(player, out string message);
+            response = message;
+            return success;
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Cube\CubeHistoryLog.cs =====
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using Exiled.API.Features;
+
+namespace EventHUD.Cube
+{
+    public static class CubeHistoryLog
+    {
+        private const int MaxLines = 15000;
+        private static readonly object Sync = new object();
+
+        public static string FilePath =>
+            Path.Combine(Paths.Configs, "EventHUD", "kub.txt");
+
+        public static void Append(string line)
+        {
+            lock (Sync)
+            {
+                try
+                {
+                    string directory = Path.GetDirectoryName(FilePath);
+
+                    if (!Directory.Exists(directory))
+                        Directory.CreateDirectory(directory);
+
+                    File.AppendAllText(
+                        FilePath,
+                        (line ?? string.Empty) + Environment.NewLine,
+                        new UTF8Encoding(false));
+
+                    TrimToMaximum();
+                }
+                catch (Exception e)
+                {
+                    Log.Error(
+                        $"[Cube] Ne udalos zapisat kub.txt: {e}");
+                }
+            }
+        }
+
+        private static void TrimToMaximum()
+        {
+            if (!File.Exists(FilePath))
+                return;
+
+            string[] lines = File.ReadAllLines(
+                FilePath,
+                Encoding.UTF8);
+
+            if (lines.Length <= MaxLines)
+                return;
+
+            string[] remaining = lines
+                .Skip(lines.Length - MaxLines)
+                .ToArray();
+
+            string temporary = FilePath + ".tmp";
+
+            File.WriteAllLines(
+                temporary,
+                remaining,
+                new UTF8Encoding(false));
+
+            if (File.Exists(FilePath))
+                File.Delete(FilePath);
+
+            File.Move(temporary, FilePath);
+        }
+
+        public static int GetLineCount()
+        {
+            lock (Sync)
+            {
+                try
+                {
+                    return File.Exists(FilePath)
+                        ? File.ReadLines(FilePath).Count()
+                        : 0;
+                }
+                catch
+                {
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Cube\CubeLootModels.cs =====
+using System;
+using System.Collections.Generic;
+
+namespace EventHUD.Cube
+{
+    public enum CubeLootCategory
+    {
+        Keycards,
+        Utilities,
+        Medicine,
+        Armor,
+        Ammo,
+        Grenades,
+        Weapons,
+        ScpItems,
+    }
+
+    public enum CubeRoomProfile
+    {
+        ZoneLight,
+        ZoneHeavy,
+        ZoneEntrance,
+        Surface,
+
+        Gr18,
+        Scp330,
+        Scp914,
+        Armory,
+        Scp049,
+        OtherScpRoom,
+    }
+
+    public sealed class WeightedEntry<T>
+    {
+        public T Value;
+        public double Weight;
+        public int LuckTier;
+
+        public WeightedEntry(T value, double weight, int luckTier = 0)
+        {
+            Value = value;
+            Weight = weight;
+            LuckTier = luckTier;
+        }
+    }
+
+    public sealed class CubeSpawnPlan
+    {
+        public int Guaranteed;
+        public List<double> ExtraChances = new List<double>();
+    }
+
+    public sealed class CubeRollRecord
+    {
+        public string RoomName;
+        public CubeRoomProfile Profile;
+
+        public int PlayerCount;
+        public int ItemCount;
+
+        public readonly List<CubeLootCategory> Categories =
+            new List<CubeLootCategory>();
+
+        public readonly List<string> Items =
+            new List<string>();
+
+        public double CountProbability;
+        public double CompositionProbability;
+
+        public double TotalProbability =>
+            CountProbability * CompositionProbability;
+    }
+
+    public sealed class KubItemInfo
+    {
+        public int Id;
+        public ItemType Type;
+        public string Name;
+        public int Section;
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Cube\CubeLootSystem.cs =====
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using EventHUD.Audio;
+using Exiled.API.Enums;
+using Exiled.API.Features;
+using Exiled.API.Features.Doors;
+using Exiled.API.Features.Pickups;
+using MEC;
+using PlayerRoles;
+using UnityEngine;
+
+namespace EventHUD.Cube
+{
+    public sealed class CubeLootSystem
+    {
+        public static CubeLootSystem Instance { get; private set; }
+
+        private bool active;
+        private CoroutineHandle scanHandle;
+
+        private readonly HashSet<Room> visitedRooms = new HashSet<Room>();
+        private readonly HashSet<Room> generatedRooms = new HashSet<Room>();
+        private readonly HashSet<Pickup> spawnedPickups = new HashSet<Pickup>();
+        private readonly Dictionary<Room, HashSet<Room>> graph =
+            new Dictionary<Room, HashSet<Room>>();
+        private bool surfaceGenerated;
+
+        private readonly Dictionary<Room, List<Vector3>> roomSpawnPoints =
+            new Dictionary<Room, List<Vector3>>();
+
+        private readonly List<CubeRollRecord> currentKubLog =
+            new List<CubeRollRecord>();
+
+        private int kubSessionNumber;
+        private DateTime kubStartedAt;
+        private DateTime? kubStoppedAt;
+
+        public int CurrentLuck { get; private set; }
+
+        private readonly List<ItemType> nextRoomItems =
+            new List<ItemType>();
+
+        private bool ConfigEnabled => Plugin.Instance?.Config.CubeLootEnabled ?? false;
+        private int PreloadDistance => Plugin.Instance?.Config.CubePreloadRoomDistance ?? 2;
+        private float ScanInterval => Plugin.Instance?.Config.CubeRoomScanInterval ?? 0.35f;
+        private float LootSpacing => Plugin.Instance?.Config.CubeLootSpacing ?? 0.65f;
+
+        private static readonly Dictionary<string, string[]> ItemAliases =
+            new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["SurfaceAccessPass"] = new[] { "KeycardCustomSite02", "KeycardCustomManagement", "KeycardCustomMetalCase" },
+            ["Lantern"] = new[] { "Lantern" },
+            ["GunA7"] = new[] { "GunA7", "A7" },
+            ["SCP127"] = new[] { "SCP127", "GunSCP127" },
+            ["AntiSCP207"] = new[] { "AntiSCP207", "SCP207Anti" },
+        };
+
+        private static string GetItemDisplayName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return "?";
+            return name;
+        }
+
+        private static string GetRussianRoomName(string typeName)
+        {
+            if (string.IsNullOrWhiteSpace(typeName))
+                return "neizvestnaya komnata";
+
+            string lower = typeName.ToLowerInvariant();
+
+            if (lower.Contains("330")) return "Komnata SCP-330";
+            if (lower.Contains("914")) return "Komnata SCP-914";
+            if (lower.Contains("049")) return "Komnata SCP-049";
+            if (lower.Contains("096")) return "Komnata SCP-096";
+            if (lower.Contains("106")) return "Komnata SCP-106";
+            if (lower.Contains("939")) return "Komnata SCP-939";
+            if (lower.Contains("173")) return "Komnata SCP-173";
+            if (lower.Contains("079")) return "Komnata SCP-079";
+            if (lower.Contains("457")) return "Komnata SCP-457";
+            if (lower.Contains("966")) return "Komnata SCP-966";
+            if (lower.Contains("gr18") || lower.Contains("glass")) return "GR-18";
+            if (lower.Contains("armory") || lower.Contains("armoury")) return "Oruzheynaya";
+            if (lower.Contains("shelter")) return "Ubezhishche";
+            if (lower.Contains("surface")) return "Poverkhnost";
+            if (lower.Contains("lcz") || lower.Contains("light")) return "Svetlaya zona";
+            if (lower.Contains("hcz") || lower.Contains("heavy")) return "Tyazhelaya zona";
+            if (lower.Contains("ez") || lower.Contains("entrance")) return "Vkhodnaya zona";
+
+            return typeName;
+        }
+
+        private static string GetRussianProfileName(CubeRoomProfile profile)
+        {
+            switch (profile)
+            {
+                case CubeRoomProfile.ZoneLight: return "Svetlaya zona";
+                case CubeRoomProfile.ZoneHeavy: return "Tyazhelaya zona";
+                case CubeRoomProfile.ZoneEntrance: return "Vkhodnaya zona";
+                case CubeRoomProfile.Surface: return "Poverkhnost";
+                case CubeRoomProfile.Gr18: return "GR-18";
+                case CubeRoomProfile.Scp330: return "SCP-330";
+                case CubeRoomProfile.Scp914: return "SCP-914";
+                case CubeRoomProfile.Armory: return "Oruzheynaya";
+                case CubeRoomProfile.Scp049: return "SCP-049";
+                case CubeRoomProfile.OtherScpRoom: return "SCP-komnata";
+                default: return profile.ToString();
+            }
+        }
+
+        public void Register()
+        {
+            Instance = this;
+            Exiled.Events.Handlers.Server.RoundStarted += OnRoundStarted;
+            Exiled.Events.Handlers.Server.RoundEnded += OnRoundEnded;
+        }
+
+        public void Unregister()
+        {
+            Disable(removeSpawnedLoot: true);
+            Exiled.Events.Handlers.Server.RoundStarted -= OnRoundStarted;
+            Exiled.Events.Handlers.Server.RoundEnded -= OnRoundEnded;
+            Instance = null;
+        }
+
+        public void Enable()
+        {
+            if (!ConfigEnabled)
+                return;
+
+            Disable(removeSpawnedLoot: true);
+
+            active = true;
+            visitedRooms.Clear();
+            generatedRooms.Clear();
+            spawnedPickups.Clear();
+            roomSpawnPoints.Clear();
+            currentKubLog.Clear();
+            surfaceGenerated = false;
+
+            CurrentLuck = Math.Max(1, Math.Min(1000000, Plugin.Instance?.Config.CubeDefaultLuck ?? 1));
+
+            kubSessionNumber++;
+            kubStartedAt = DateTime.Now;
+            kubStoppedAt = null;
+
+            CubeHistoryLog.Append("");
+            CubeHistoryLog.Append(
+                $"========== KUB #{kubSessionNumber} NACHAT " +
+                $"{kubStartedAt:dd.MM.yyyy HH:mm:ss} ==========");
+
+            BuildRoomGraph();
+
+            if (graph.Count == 0)
+            {
+                Timing.CallDelayed(2f, () =>
+                {
+                    if (!active) return;
+                    BuildRoomGraph();
+                });
+            }
+
+            scanHandle = Timing.RunCoroutine(ScanLoop());
+
+            FileLog.Write(
+                $"[Cube] Nachat novyy zapusk Kuba #{kubSessionNumber}. " +
+                $"Komnat v grafe: {graph.Count}, distantsiya: {PreloadDistance}");
+        }
+
+        public void Disable(bool removeSpawnedLoot)
+        {
+            active = false;
+
+            if (scanHandle.IsRunning)
+                Timing.KillCoroutines(scanHandle);
+
+            if (removeSpawnedLoot)
+            {
+                foreach (Pickup pickup in spawnedPickups.ToList())
+                {
+                    try
+                    {
+                        if (pickup != null && pickup.Base != null)
+                            pickup.Destroy();
+                    }
+              

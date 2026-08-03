@@ -1,0 +1,575 @@
+      {
+            state.EscalateBleeding(GlobalCondition.BleedingHeavy);
+            player.EnableEffect<Concussed>(config.HeavyBleedConcussedDuration);
+            player.EnableEffect<Deafened>(config.HeavyBleedDeafenedDuration);
+            player.EnableEffect<Blindness>(config.HeavyBleedBlindnessDuration);
+            player.ChangeEffectIntensity<Blindness>(config.HeavyBleedBlindnessIntensity);
+        }
+
+        private static bool IsHeavyBleedFirearm(ItemType weapon, BodyPart bodyPart)
+        {
+            if (bodyPart == BodyPart.Neck)
+                return true;
+
+            switch (weapon)
+            {
+                case ItemType.GunAK:
+                case ItemType.GunLogicer:
+                case ItemType.GunFRMG0:
+                case ItemType.GunA7:
+                    return bodyPart.IsVital();
+
+                case ItemType.GunShotgun:
+                    return bodyPart == BodyPart.Chest ||
+                           bodyPart == BodyPart.Abdomen ||
+                           bodyPart == BodyPart.Neck;
+
+                case ItemType.GunE11SR:
+                    return bodyPart == BodyPart.Neck || bodyPart == BodyPart.Head;
+
+                case ItemType.GunRevolver:
+                    return bodyPart == BodyPart.Head ||
+                           bodyPart == BodyPart.Chest ||
+                           bodyPart == BodyPart.Neck;
+
+                case ItemType.GunCrossvec:
+                    return bodyPart == BodyPart.Neck;
+
+                default:
+                    return false;
+            }
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\InjuryTickService.cs =====
+using System;
+using System.Collections.Generic;
+using CustomPlayerEffects;
+using EventHUD.Hud;
+using Exiled.API.Features;
+using MEC;
+
+namespace EventHUD.Medicine
+{
+    public class InjuryTickService
+    {
+        private CoroutineHandle _tickHandle;
+
+        private readonly Dictionary<string, DateTime> _lastPassiveTick =
+            new Dictionary<string, DateTime>();
+
+        public void Start()
+        {
+            _tickHandle = Timing.RunCoroutine(TickLoop());
+        }
+
+        public void Stop()
+        {
+            Timing.KillCoroutines(_tickHandle);
+            _lastPassiveTick.Clear();
+        }
+
+        private IEnumerator<float> TickLoop()
+        {
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(
+                    Plugin.Instance.Config.InjuryTickInterval);
+
+                if (!Rpm.RpModuleManager.Instance.IsEnabled(
+                        Rpm.RpModuleType.Medicine))
+                {
+                    continue;
+                }
+
+                foreach (Player player in Player.List)
+                {
+                    if (player == null || !player.IsAlive)
+                        continue;
+
+                    SyncScpItemConditions(player);
+
+                    if (!MedicalStorage.TryGet(
+                            player.UserId,
+                            out PlayerMedicalState state))
+                    {
+                        continue;
+                    }
+
+                    if (state.FirstAidUsed &&
+                        state.FirstAidOriginalBleeding.HasValue &&
+                        state.CheckFirstAidExpiry())
+                    {
+                        ResetPlayer(player.UserId);
+
+                        HudNoticeService.Show(
+                            player,
+                            "<color=red>Временная повязка слетела! " +
+                            "Кровотечение возобновилось.</color>",
+                            3f);
+                    }
+
+                    GlobalCondition? bleeding = state.GetBleedingLevel();
+                    if (!bleeding.HasValue)
+                        continue;
+
+                    ProcessBleedingTick(player, state, bleeding.Value);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Синхронизирует медицинские состояния с фактически
+        /// активными эффектами SCP-1853 и Anti-SCP-207.
+        /// </summary>
+        private static void SyncScpItemConditions(Player player)
+        {
+            bool has1853 = player.IsEffectActive<Scp1853>();
+            bool hasAnti207 = player.IsEffectActive<AntiScp207>();
+
+            // Не создаём пустое медицинское состояние без необходимости.
+            if (!has1853 &&
+                !hasAnti207 &&
+                !MedicalStorage.TryGet(player.UserId, out _))
+            {
+                return;
+            }
+
+            PlayerMedicalState state =
+                MedicalStorage.GetOrCreate(player.UserId);
+
+            if (has1853 && hasAnti207)
+            {
+                state.RemoveCondition(GlobalCondition.Under1853);
+                state.AddCondition(GlobalCondition.Poisoned);
+                return;
+            }
+
+            state.RemoveCondition(GlobalCondition.Poisoned);
+
+            if (has1853)
+                state.AddCondition(GlobalCondition.Under1853);
+            else
+                state.RemoveCondition(GlobalCondition.Under1853);
+        }
+
+        private void ProcessBleedingTick(
+            Player player,
+            PlayerMedicalState state,
+            GlobalCondition bleedLevel)
+        {
+            Config config = Plugin.Instance.Config;
+            DateTime now = DateTime.UtcNow;
+
+            float elapsed =
+                (float)(now - state.BleedingStartedAt).TotalSeconds;
+
+            float burstDps;
+            float burstDuration;
+            float passiveDps;
+            float passiveInterval;
+
+            switch (bleedLevel)
+            {
+                case GlobalCondition.BleedingLight:
+                    burstDps = config.LightBleedBurstDps;
+                    burstDuration = config.LightBleedBurstDuration;
+                    passiveDps = config.LightBleedPassiveDps;
+                    passiveInterval = config.LightBleedPassiveInterval;
+                    break;
+
+                case GlobalCondition.BleedingMedium:
+                    burstDps = config.MediumBleedBurstDps;
+                    burstDuration = config.MediumBleedBurstDuration;
+                    passiveDps = config.MediumBleedPassiveDps;
+                    passiveInterval = config.MediumBleedPassiveInterval;
+                    break;
+
+                case GlobalCondition.BleedingHeavy:
+                    burstDps = config.HeavyBleedBurstDps;
+                    burstDuration = config.HeavyBleedBurstDuration;
+                    passiveDps = config.HeavyBleedPassiveDps;
+                    passiveInterval = config.HeavyBleedPassiveInterval;
+                    break;
+
+                default:
+                    return;
+            }
+
+            float tickInterval = config.InjuryTickInterval;
+
+            if (!state.BleedingBurstFinished)
+            {
+                if (elapsed < burstDuration)
+                {
+                    player.Hurt(
+                        burstDps * tickInterval,
+                        "Кровотечение");
+                }
+                else
+                {
+                    state.BleedingBurstFinished = true;
+                    _lastPassiveTick[player.UserId] = now;
+                }
+
+                return;
+            }
+
+            if (!_lastPassiveTick.TryGetValue(
+                    player.UserId,
+                    out DateTime lastTick))
+            {
+                _lastPassiveTick[player.UserId] = now;
+                return;
+            }
+
+            if ((now - lastTick).TotalSeconds < passiveInterval)
+                return;
+
+            player.Hurt(passiveDps, "Кровотечение");
+            _lastPassiveTick[player.UserId] = now;
+        }
+
+        public void ResetPlayer(string userId)
+        {
+            _lastPassiveTick.Remove(userId);
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\LocalInjury.cs =====
+using System;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Одна конкретная травма на конкретной части тела.
+    /// </summary>
+    public class LocalInjury
+    {
+        public LocalInjuryType Type     { get; set; }
+        public BodyPart        Part     { get; set; }
+        public DateTime        OccurredAt { get; set; }
+
+        public LocalInjury(LocalInjuryType type, BodyPart part)
+        {
+            Type       = type;
+            Part       = part;
+            OccurredAt = DateTime.UtcNow;
+        }
+
+        /// <summary>
+        /// Строка для HUD: "Огнестр.(пр.р)"
+        /// </summary>
+        public string ToHudString()
+        {
+            return $"<color={Type.GetColor()}>{Type.GetShortName()}({Part.GetShortName()})</color>";
+        }
+
+        /// <summary>
+        /// Полная строка для команды .injuries
+        /// </summary>
+        public string ToFullString()
+        {
+            return $"{Type.GetFullName()} — {Part.GetFullName()} ({(DateTime.UtcNow - OccurredAt).TotalSeconds:0}с назад)";
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\LocalInjuryType.cs =====
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Типы травм, привязанных к части тела.
+    /// </summary>
+    public enum LocalInjuryType
+    {
+        Bruise,         // Ушиб (тупая)
+        Gunshot,        // Огнестрельная
+        Stab,           // Ножевая / резаная
+        Chemical,       // Химическая
+        Corrosion,      // Коррозия (SCP-106)
+        Burn,           // Ожоговая
+        Fracture        // Перелом
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\LocalInjuryTypeExtensions.cs =====
+namespace EventHUD.Medicine
+{
+    public static class LocalInjuryTypeExtensions
+    {
+        public static string GetColor(this LocalInjuryType t) => t switch
+        {
+            LocalInjuryType.Bruise    => "#996600",
+            LocalInjuryType.Gunshot   => "#990000",
+            LocalInjuryType.Stab      => "#aa2200",
+            LocalInjuryType.Chemical  => "#669900",
+            LocalInjuryType.Corrosion => "#2d4a1e",
+            LocalInjuryType.Burn      => "#cc4400",
+            LocalInjuryType.Fracture  => "#660066",
+            _                         => "#FFFFFF"
+        };
+
+        /// <summary>
+        /// Понятное имя для HUD — без сокращений.
+        /// </summary>
+        public static string GetShortName(this LocalInjuryType t) => t switch
+        {
+            LocalInjuryType.Bruise    => "Ушиб",
+            LocalInjuryType.Gunshot   => "Огнестрел",
+            LocalInjuryType.Stab      => "Ножевая",
+            LocalInjuryType.Chemical  => "Химическая",
+            LocalInjuryType.Corrosion => "Коррозия",
+            LocalInjuryType.Burn      => "Ожог",
+            LocalInjuryType.Fracture  => "Перелом",
+            _                         => "?"
+        };
+
+        public static string GetFullName(this LocalInjuryType t) => t switch
+        {
+            LocalInjuryType.Bruise    => "Ушиб",
+            LocalInjuryType.Gunshot   => "Огнестрельная",
+            LocalInjuryType.Stab      => "Ножевая",
+            LocalInjuryType.Chemical  => "Химическая",
+            LocalInjuryType.Corrosion => "Коррозия",
+            LocalInjuryType.Burn      => "Ожоговая",
+            LocalInjuryType.Fracture  => "Перелом",
+            _                         => "?"
+        };
+
+        /// <summary>
+        /// Приоритет для сортировки в HUD.
+        /// </summary>
+        public static int GetPriority(this LocalInjuryType t) => t switch
+        {
+            LocalInjuryType.Corrosion => 95,
+            LocalInjuryType.Fracture  => 75,
+            LocalInjuryType.Gunshot   => 70,
+            LocalInjuryType.Stab      => 60,
+            LocalInjuryType.Burn      => 55,
+            LocalInjuryType.Chemical  => 50,
+            LocalInjuryType.Bruise    => 30,
+            _                         => 0
+        };
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedicalStorage.cs =====
+using System.Collections.Generic;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Хранилище медицинских состояний всех игроков.
+    /// Ключ — UserId.
+    /// </summary>
+    public static class MedicalStorage
+    {
+        private static readonly Dictionary<string, PlayerMedicalState> _states = new();
+
+        public static PlayerMedicalState GetOrCreate(string userId)
+        {
+            if (!_states.TryGetValue(userId, out var state))
+            {
+                state = new PlayerMedicalState();
+                state.Reset(); // Начинаем с Normal
+                _states[userId] = state;
+            }
+            return state;
+        }
+
+        public static bool TryGet(string userId, out PlayerMedicalState state) =>
+            _states.TryGetValue(userId, out state);
+
+        public static void Remove(string userId)
+        {
+            if (string.IsNullOrEmpty(userId))
+                return;
+            _states.Remove(userId);
+        }
+
+        /// <summary>Вызывать при старте нового раунда.</summary>
+        public static void ClearAll() => _states.Clear();
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedicineConfig.cs =====
+using System.ComponentModel;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Все настройки модуля медицины — добавляются в основной Config.cs как секция.
+    /// Здесь описаны как отдельный partial-подобный блок для читаемости,
+    /// но фактически поля должны быть в Config.cs.
+    /// Этот файл — справочник значений по умолчанию.
+    /// </summary>
+    public static class MedicineDefaults
+    {
+        // ── Адреналин ──
+        public const int AdrenalineOverdoseThreshold   = 3;    // 3+ за жизнь = передоз
+        public const float OverdoseEffectDuration       = 25f;  // Blurred/Slowness/Asphyxiated длительность
+        public const byte OverdoseSlownessIntensity     = 55;
+        public const byte OverdoseAsphyxiatedIntensity  = 25;
+
+        // ── Обезболивающее ──
+        public const int PainkillerOverdoseThreshold    = 4;    // 4+ за жизнь = передоз
+
+        // ── Капиллярное кровотечение ──
+        public const float LightBleedGrenadeMaxDamage   = 10f;  // Граната < 10 = капиллярное
+        public const float LightBleedFallMaxDamage      = 15f;  // Падение < 15 = капиллярное
+        public const float LightBleedConcussedDuration  = 5f;
+        public const float LightBleedBurstDps           = 2f;   // −2 HP/сек
+        public const float LightBleedBurstDuration      = 5f;   // 5 сек бурной фазы (итого −10)
+        public const float LightBleedPassiveDps         = 1f;   // −1 HP / 10 сек
+        public const float LightBleedPassiveInterval    = 10f;
+
+        // ── Венозное кровотечение ──
+        public const float MediumBleedGrenadeMinDamage  = 15f;
+        public const float MediumBleedGrenadeMaxDamage  = 50f;
+        public const float MediumBleedConcussedDuration = 10f;
+        public const float MediumBleedDeafenedDuration  = 15f;
+        public const byte  MediumBleedBlindnessIntensity = 40;
+        public const float MediumBleedBlindnessDuration = 30f;
+        public const float MediumBleedBurstDps          = 6f;   // −6 HP/сек
+        public const float MediumBleedBurstDuration     = 5f;   // 5 сек (итого −30)
+        public const float MediumBleedPassiveDps        = 3f;   // −3 HP / 10 сек
+        public const float MediumBleedPassiveInterval   = 10f;
+
+        // ── Артериальное кровотечение ──
+        public const float HeavyBleedConcussedDuration  = 10f;
+        public const float HeavyBleedDeafenedDuration   = 15f;
+        public const byte  HeavyBleedBlindnessIntensity = 40;
+        public const float HeavyBleedBlindnessDuration  = 30f;
+        public const float HeavyBleedBurstDps           = 2f;   // −2 HP/сек (но 30 сек!)
+        public const float HeavyBleedBurstDuration      = 30f;  // 30 сек (итого −60)
+        public const float HeavyBleedPassiveDps         = 5f;   // −5 HP / 10 сек
+        public const float HeavyBleedPassiveInterval    = 10f;
+
+        // ── Контузия ──
+        public const float ConcussionFlashRadius        = 15f;
+        public const float ConcussionGrenadeRadius      = 30f;
+        public const float SevereConcussionRadius       = 5f;
+
+        // ── Коррозия SCP-106 ──
+        public const float CorrosionProximityTime       = 3f;   // 3 сек рядом с 106
+        public const float CorrosionStainedDuration     = 3000f;
+        public const byte  CorrosionBlindnessIntensity  = 45;
+        public const float CorrosionConcussedDuration   = 3000f;
+
+        // ── Химическая SCP-244 ──
+        public const float Scp244ProximityTime          = 10f;
+        public const float ChemicalConcussedDuration    = 60f;
+
+        // ── Ожог Micro-HID ──
+        public const float BurnDuration                 = 10f;
+
+        // ── Перелом ──
+        public const byte  FractureSlownessIntensity    = 70;
+        public const float FractureConcussedDuration    = 30f;
+
+        // ── Тики ──
+        public const float InjuryTickInterval           = 1f;   // Проверка каждую секунду
+
+        // ── HUD ──
+        public const float MedicineHudVoffset           = 58f;
+        public const float MedicineHudVoffset2          = 57f;  // Вторая строка если >2 травм
+        public const float MedicineHudIndent            = -29.5f;
+        public const string MedicineHudLabel            = "Состояние";
+        public const int MaxHudItemsPerLine             = 3;
+        public const int MaxHudLines                    = 2;
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedicineEventHandlers.cs =====
+using System;
+using System.Linq;
+using Exiled.API.Enums;
+using Exiled.API.Features;
+using Exiled.Events.EventArgs.Player;
+using Exiled.API.Features.DamageHandlers;
+using EventHUD.Rpm;
+using MEC;
+using PlayerStatsSystem;
+
+namespace EventHUD.Medicine
+{
+    public class MedicineEventHandlers
+    {
+        private readonly Config _config;
+
+        public MedicineEventHandlers(Config config)
+        {
+            _config = config;
+        }
+
+        public void OnHurting(HurtingEventArgs ev)
+        {
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                return;
+
+            if (ev.Player == null || !ev.Player.IsAlive)
+                return;
+
+            // SCP не получают травмы
+            if (ev.Player.Role.Team == PlayerRoles.Team.SCPs)
+                return;
+
+            float damage = ev.Amount;
+            var damageType = ev.DamageHandler.Type;
+
+            if (_config.Debug)
+            {
+                Exiled.API.Features.Log.Debug(
+                    $"[Medicine] OnHurting: Player={ev.Player.Nickname}, " +
+                    $"DamageType={damageType}, Amount={damage}");
+            }
+
+            HitboxType hitbox = HitboxType.Body;
+            if (ev.DamageHandler.Base is StandardDamageHandler sdh)
+                hitbox = sdh.Hitbox;
+
+            // Penetration
+            float penetration = GetDefaultPenetration(damageType);
+            try
+            {
+                var exiledHandler = ev.DamageHandler as Exiled.API.Features.DamageHandlers.DamageHandlerBase;
+                if (exiledHandler != null)
+                {
+                    var penProp = exiledHandler.GetType().GetProperty("Penetration");
+                    if (penProp != null)
+                    {
+                        var val = penProp.GetValue(exiledHandler);
+                        if (val is float f && f > 0f)
+                            penetration = f;
+                    }
+                }
+            }
+            catch { }
+
+            switch (damageType)
+            {
+                // ── Огнестрельное ──
+                case DamageType.Com15:
+                case DamageType.Com18:
+                case DamageType.Com45:
+                case DamageType.Revolver:
+                case DamageType.Fsp9:
+                case DamageType.Crossvec:
+                case DamageType.Shotgun:
+                case DamageType.AK:
+                case DamageType.Logicer:
+                case DamageType.E11Sr:
+                case DamageType.Frmg0:
+                case DamageType.A7:
+                case DamageType.Firearm:
+                {
+               

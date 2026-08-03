@@ -1,0 +1,616 @@
+�течения (самый тяжёлый).
+        /// </summary>
+        public GlobalCondition? GetBleedingLevel()
+        {
+            if (HasCondition(GlobalCondition.BleedingHeavy))  return GlobalCondition.BleedingHeavy;
+            if (HasCondition(GlobalCondition.BleedingMedium)) return GlobalCondition.BleedingMedium;
+            if (HasCondition(GlobalCondition.BleedingLight))  return GlobalCondition.BleedingLight;
+            return null;
+        }
+
+        /// <summary>
+        /// Повысить уровень кровотечения. Если уже артериальное — ничего не делает.
+        /// </summary>
+        public void EscalateBleeding(GlobalCondition newLevel)
+        {
+            var current = GetBleedingLevel();
+
+            // Убираем предыдущий уровень
+            if (current.HasValue)
+            {
+                if ((int)newLevel <= (int)current.Value)
+                    return; // Уже равный или более тяжёлый уровень
+
+                Conditions.Remove(current.Value);
+            }
+
+            AddCondition(newLevel);
+            BleedingStartedAt     = DateTime.UtcNow;
+            BleedingBurstFinished = false;
+        }
+
+        /// <summary>
+        /// Первая помощь: понизить уровень кровотечения на 1 ступень на 60 сек.
+        /// Тратит 1 бинт. Одноразово до полного излечения.
+        /// </summary>
+        public bool TryApplyFirstAid(out GlobalCondition? originalLevel)
+        {
+            originalLevel = GetBleedingLevel();
+            if (!originalLevel.HasValue) return false;
+            if (FirstAidUsed) return false;
+
+            GlobalCondition? downgraded = originalLevel.Value switch
+            {
+                GlobalCondition.BleedingHeavy  => GlobalCondition.BleedingMedium,
+                GlobalCondition.BleedingMedium => GlobalCondition.BleedingLight,
+                GlobalCondition.BleedingLight  => (GlobalCondition?)null,
+                _ => null
+            };
+
+            // Убираем текущее кровотечение
+            RemoveCondition(originalLevel.Value);
+
+            if (downgraded.HasValue)
+            {
+                AddCondition(downgraded.Value);
+                BleedingStartedAt = DateTime.UtcNow;
+                BleedingBurstFinished = false;
+            }
+
+            FirstAidUsed = true;
+            FirstAidOriginalBleeding = originalLevel;
+            FirstAidExpiresAt = DateTime.UtcNow.AddSeconds(60);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Проверка истечения первой помощи — восстановить исходное кровотечение.
+        /// Возвращает true если кровотечение было восстановлено.
+        /// </summary>
+        public bool CheckFirstAidExpiry()
+        {
+            if (!FirstAidUsed || FirstAidOriginalBleeding == null)
+                return false;
+            if (DateTime.UtcNow < FirstAidExpiresAt)
+                return false;
+
+            // Восстанавливаем исходное кровотечение
+            var current = GetBleedingLevel();
+            if (current.HasValue)
+                RemoveCondition(current.Value);
+
+            AddCondition(FirstAidOriginalBleeding.Value);
+            BleedingStartedAt = DateTime.UtcNow;
+            BleedingBurstFinished = false;
+
+            // Сбрасываем флаг — можно применять первую помощь снова?
+            // По ТЗ — одноразово до полного излечения, оставляем Used=true
+            // Чтобы можно было повторно — раскомментируй:
+            // FirstAidUsed = false;
+            FirstAidOriginalBleeding = null;
+            FirstAidExpiresAt = default;
+
+            return true;
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\RegenService.cs =====
+using System;
+using System.Collections.Generic;
+using Exiled.API.Features;
+using MEC;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Регенерация HP после полного лечения.
+    /// Лёгкие раны: до 100 HP за 1 мин (≈1.67 HP/с)
+    /// Средние: до 100 HP за 2 мин (≈0.83 HP/с)
+    /// Тяжёлые: до 100 HP за 5 мин (≈0.33 HP/с)
+    /// </summary>
+    public enum RegenTier
+    {
+        None,
+        Light,   // 1 мин до 100 HP
+        Medium,  // 2 мин до 100 HP
+        Heavy    // 5 мин до 100 HP
+    }
+
+    public class RegenState
+    {
+        public RegenTier Tier;
+        public DateTime StartedAt;
+    }
+
+    public static class RegenStorage
+    {
+        private static readonly Dictionary<string, RegenState> _states = new();
+
+        public static void Start(string userId, RegenTier tier)
+        {
+            // Берём самый тяжёлый тир если уже есть
+            if (_states.TryGetValue(userId, out var existing))
+            {
+                if ((int)tier > (int)existing.Tier)
+                    existing.Tier = tier;
+                return;
+            }
+
+            _states[userId] = new RegenState
+            {
+                Tier = tier,
+                StartedAt = DateTime.UtcNow
+            };
+        }
+
+        public static void Stop(string userId) => _states.Remove(userId);
+
+        public static bool TryGet(string userId, out RegenState state) =>
+            _states.TryGetValue(userId, out state);
+
+        public static void ClearAll() => _states.Clear();
+    }
+
+    public class RegenTickService
+    {
+        private CoroutineHandle _handle;
+
+        public void Start() => _handle = Timing.RunCoroutine(TickLoop());
+        public void Stop() => Timing.KillCoroutines(_handle);
+
+        private IEnumerator<float> TickLoop()
+        {
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(1f);
+
+                foreach (var player in Player.List)
+                {
+                    if (!player.IsAlive)
+                        continue;
+
+                    if (!RegenStorage.TryGet(player.UserId, out var regen))
+                        continue;
+
+                    if (regen.Tier == RegenTier.None)
+                        continue;
+
+                    // Если у игрока ещё есть активные травмы — не хилим
+                    if (MedicalStorage.TryGet(player.UserId, out var med) && med.HasAnything)
+                    {
+                        RegenStorage.Stop(player.UserId);
+                        continue;
+                    }
+
+                    if (player.Health >= player.MaxHealth)
+                    {
+                        RegenStorage.Stop(player.UserId);
+                        continue;
+                    }
+
+                    float hpPerSec = regen.Tier switch
+                    {
+                        RegenTier.Light  => 100f / 60f,   // ~1.67 HP/с
+                        RegenTier.Medium => 100f / 120f,  // ~0.83 HP/с
+                        RegenTier.Heavy  => 100f / 300f,  // ~0.33 HP/с
+                        _                => 0f
+                    };
+
+                    player.Health = Math.Min(player.Health + hpPerSec, player.MaxHealth);
+                }
+            }
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\SimpleMedkitService.cs =====
+using System;
+using System.Collections.Generic;
+using Exiled.API.Features;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Лечение без биндов (FullRP выключен).
+    /// Аптечки типизированы (гражданская/рабочая/военная/парамедик) и имеют
+    /// общий ресурс использований: 5 / 10 / 15 / 30.
+    /// Капиллярное = 1, венозное = 2, артериальное = 3, перелом = 3,
+    /// остальные травмы = 2, ушиб = 1 использование.
+    /// </summary>
+    public class SimpleMedkitService
+    {
+        private class Progress { public string TargetKey; public int Uses; }
+
+        private readonly Dictionary<string, Progress> _progress = new Dictionary<string, Progress>();
+        private readonly Dictionary<string, DateTime> _lastUse = new Dictionary<string, DateTime>();
+        private const float UseCooldown = 2f;
+
+        public void ResetPlayer(string userId)
+        {
+            _progress.Remove(userId);
+            _lastUse.Remove(userId);
+        }
+
+        public void ClearAll()
+        {
+            _progress.Clear();
+            _lastUse.Clear();
+        }
+
+        public void OnMedkitUsed(Player player, ushort serial)
+        {
+            if (player == null || !player.IsAlive) return;
+
+            if (_lastUse.TryGetValue(player.UserId, out var last) &&
+                (DateTime.UtcNow - last).TotalSeconds < UseCooldown)
+                return;
+            _lastUse[player.UserId] = DateTime.UtcNow;
+
+            if (!MedkitInventoryStorage.TryGet(serial, out var kit))
+                kit = MedkitInventoryStorage.GetOrCreate(serial, MedkitTypeAssigner.GetByRole(player));
+
+            if (kit.SimpleUses <= 0)
+                kit.SimpleUses = GetMaxUses(kit.Type);
+
+            kit.SimpleUses--;
+
+            ProcessHealing(player);
+
+            MedkitInventoryStorage.Remove(serial);
+            if (kit.SimpleUses > 0)
+            {
+                var newItem = player.AddItem(ItemType.Medkit);
+                if (newItem != null)
+                    MedkitInventoryStorage.Set(newItem.Serial, kit);
+            }
+        }
+
+        private void ProcessHealing(Player player)
+        {
+            var medState = MedicalStorage.GetOrCreate(player.UserId);
+
+            var bleeding = medState.GetBleedingLevel();
+            if (bleeding.HasValue)
+            {
+                var target = bleeding.Value;
+                HandleTarget(player, $"g:{target}", GetUsesFor(target),
+                    () => MedkitHealService.CureGlobal(player, medState, target));
+                return;
+            }
+
+            LocalInjury injury = null;
+            foreach (var inj in medState.Injuries)
+            {
+                if (inj.Type == LocalInjuryType.Corrosion) continue;
+                injury = inj;
+                break;
+            }
+
+            if (injury == null)
+            {
+                _progress.Remove(player.UserId);
+                return;
+            }
+
+            var type = injury.Type;
+            var part = injury.Part;
+            HandleTarget(player, $"l:{type}:{part}", GetUsesFor(type),
+                () => MedkitHealService.CureLocal(player, medState, type, part));
+        }
+
+        private void HandleTarget(Player player, string key, int required, Action cure)
+        {
+            if (!_progress.TryGetValue(player.UserId, out var p) || p.TargetKey != key)
+            {
+                p = new Progress { TargetKey = key, Uses = 0 };
+                _progress[player.UserId] = p;
+            }
+
+            p.Uses++;
+
+            if (p.Uses >= required)
+            {
+                _progress.Remove(player.UserId);
+                cure();
+            }
+        }
+
+        public static int GetMaxUses(MedkitType type)
+        {
+            switch (type)
+            {
+                case MedkitType.Paramedic:  return 30;
+                case MedkitType.Military:   return 15;
+                case MedkitType.Industrial: return 10;
+                default:                    return 5;
+            }
+        }
+
+        private int GetUsesFor(GlobalCondition bleeding)
+        {
+            switch (bleeding)
+            {
+                case GlobalCondition.BleedingHeavy:  return 3;
+                case GlobalCondition.BleedingMedium: return 2;
+                default:                             return 1;
+            }
+        }
+
+        private int GetUsesFor(LocalInjuryType type)
+        {
+            switch (type)
+            {
+                case LocalInjuryType.Fracture: return 3;
+                case LocalInjuryType.Bruise:   return 1;
+                default:                       return 2;
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Models\EventSession.cs =====
+using System;
+using EventHUD.Enums;
+
+namespace EventHUD.Models
+{
+    public class EventSession
+    {
+        public EventState State { get; set; } = EventState.None;
+
+        public string  EventName    { get; set; }
+        public RPType  RpType       { get; set; }
+        public string  HostUserId   { get; set; }
+        public string  HostNickname { get; set; }
+        public bool    HostIsOnline { get; set; } = true;
+
+        public DateTime StartedAt  { get; set; }
+        public DateTime StoppedAt  { get; set; }
+
+        public DateTime HostReturnedAt          { get; set; }
+        public bool     ShowHostReturnHighlight  { get; set; }
+
+        public TimeSpan Elapsed =>
+            StartedAt == default ? TimeSpan.Zero : DateTime.UtcNow - StartedAt;
+
+        public void Reset()
+        {
+            State                   = EventState.None;
+            EventName               = null;
+            HostUserId              = null;
+            HostNickname            = null;
+            HostIsOnline            = true;
+            StartedAt               = default;
+            StoppedAt               = default;
+            HostReturnedAt          = default;
+            ShowHostReturnHighlight = false;
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Norma\NormaSystem.cs =====
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using Exiled.API.Features;
+using MEC;
+
+namespace EventHUD.Norma
+{
+    public class NormaSystem
+    {
+        public static NormaSystem Instance { get; private set; }
+
+        private readonly Dictionary<string, string> _roles = new Dictionary<string, string>();
+        private readonly Dictionary<string, string> _nicks = new Dictionary<string, string>();
+        private readonly Dictionary<string, long> _open = new Dictionary<string, long>();
+
+        private readonly object _fileLock = new object();
+        private static readonly object DbgLock = new object();
+        private CoroutineHandle _loop;
+
+        private static readonly Regex RaLine =
+            new Regex(@"^\s*-\s*([^\s:]+@[^\s:]+)\s*:\s*(\S+)\s*$", RegexOptions.Compiled);
+
+        private string DataFile => Path.Combine(Paths.Configs, "EventHUD", "norma.txt");
+
+        private static long Now => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        // ================= ЛОГ =================
+        public static void Dbg(string msg)
+        {
+            try
+            {
+                string dir = Path.Combine(Paths.Configs, "EventHUD");
+                Directory.CreateDirectory(dir);
+                string file = Path.Combine(dir, "debugnorma.txt");
+                string line = "[" + DateTime.Now.ToString("dd.MM HH:mm:ss") + "] " + msg;
+
+                lock (DbgLock)
+                    File.AppendAllText(file, line + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        // ================= ЖИЗНЕННЫЙ ЦИКЛ =================
+
+        public void Enable()
+        {
+            Instance = this;
+
+            Dbg("==================================================");
+            Dbg("ENABLE start");
+
+            try
+            {
+                Dbg("Paths.Configs = " + Paths.Configs);
+                Dbg("DataFile      = " + DataFile);
+                Dbg("RA path       = " + Plugin.Instance.Config.NormaRemoteAdminPath);
+                Dbg("Webhook set   = " + (!string.IsNullOrEmpty(Plugin.Instance.Config.NormaWebhook)));
+                Dbg("NormaHours ролей в конфиге = " + Plugin.Instance.Config.NormaHours.Count);
+
+                EnsureFile();
+                LoadNicks();
+                ReloadAdmins();
+                PruneOld();
+
+                Exiled.Events.Handlers.Player.Verified += OnVerified;
+                Exiled.Events.Handlers.Player.Left += OnLeft;
+
+                foreach (Player p in Player.List)
+                    TryOpen(p);
+
+                _loop = Timing.RunCoroutine(Loop());
+
+                Dbg("ENABLE ok. Админов в списке: " + _roles.Count + ", онлайн сейчас: " + _open.Count);
+                Log.Info("[Норма] Запущено. Админов: " + _roles.Count + ". Лог: debugnorma.txt");
+            }
+            catch (Exception e)
+            {
+                Dbg("ENABLE FAIL: " + e);
+                Log.Error("[Норма] Ошибка запуска: " + e);
+            }
+        }
+
+        public void Disable()
+        {
+            Dbg("DISABLE");
+
+            Timing.KillCoroutines(_loop);
+
+            Exiled.Events.Handlers.Player.Verified -= OnVerified;
+            Exiled.Events.Handlers.Player.Left -= OnLeft;
+
+            FlushSessions(true);
+            Instance = null;
+        }
+
+        private IEnumerator<float> Loop()
+        {
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(300f);
+
+                try
+                {
+                    FlushSessions(false);
+                    ReloadAdmins();
+                    CheckAutoReport();
+                }
+                catch (Exception e)
+                {
+                    Dbg("LOOP FAIL: " + e.Message);
+                }
+            }
+        }
+
+        // ================= АДМИНЫ =================
+
+        public void ReloadAdmins()
+        {
+            try
+            {
+                string path = Plugin.Instance.Config.NormaRemoteAdminPath;
+
+                if (!File.Exists(path))
+                {
+                    Dbg("ADMINS FAIL: файл не найден -> " + path);
+                    return;
+                }
+
+                Dictionary<string, double> hours = Plugin.Instance.Config.NormaHours;
+                Dictionary<string, string> found = new Dictionary<string, string>();
+                int lines = 0;
+
+                foreach (string raw in File.ReadAllLines(path))
+                {
+                    lines++;
+                    Match m = RaLine.Match(raw);
+                    if (!m.Success)
+                        continue;
+
+                    string userId = m.Groups[1].Value.Trim();
+                    string role = m.Groups[2].Value.Trim();
+
+                    if (found.TryGetValue(userId, out string old))
+                    {
+                        double oldNorm = hours.TryGetValue(old, out double a) ? a : -1;
+                        double newNorm = hours.TryGetValue(role, out double b) ? b : -1;
+                        if (newNorm <= oldNorm)
+                            continue;
+                    }
+
+                    found[userId] = role;
+                }
+
+                Dbg("ADMINS: прочитано строк " + lines + ", распознано админов " + found.Count);
+
+                if (found.Count == 0)
+                {
+                    Dbg("ADMINS FAIL: ни одной строки вида '- 7656...@steam: role'");
+                    return;
+                }
+
+                _roles.Clear();
+                foreach (KeyValuePair<string, string> kv in found)
+                    _roles[kv.Key] = kv.Value;
+            }
+            catch (Exception e)
+            {
+                Dbg("ADMINS FAIL: " + e.Message);
+            }
+        }
+
+        private bool IsTracked(string userId) =>
+            !string.IsNullOrEmpty(userId) && _roles.ContainsKey(userId);
+
+        // ================= ВРЕМЯ =================
+
+        private void OnVerified(Exiled.Events.EventArgs.Player.VerifiedEventArgs ev) => TryOpen(ev.Player);
+
+        private void OnLeft(Exiled.Events.EventArgs.Player.LeftEventArgs ev) => TryClose(ev.Player);
+
+        private void TryOpen(Player p)
+        {
+            try
+            {
+                if (p == null || string.IsNullOrEmpty(p.UserId))
+                    return;
+
+                if (!IsTracked(p.UserId))
+                {
+                    Dbg("JOIN не админ (нет в файле админов): " + p.UserId);
+                    return;
+                }
+
+                _open[p.UserId] = Now;
+                RememberNick(p.UserId, p.Nickname);
+                Dbg("JOIN админ: " + p.Nickname + " (" + p.UserId + ", роль " + _roles[p.UserId] + ")");
+            }
+            catch (Exception e) { Dbg("JOIN FAIL: " + e.Message); }
+        }
+
+        private void TryClose(Player p)
+        {
+            try
+            {
+                if (p == null || string.IsNullOrEmpty(p.UserId))
+                    return;
+
+                if (!_open.TryGetValue(p.UserId, out long start))
+                    return;
+
+                _open.Remove(p.UserId);
+                WriteSession(p.UserId, start, Now);
+                RememberNick(p.UserId, p.Nickname

@@ -1,0 +1,505 @@
+�ей (защита от переполнения памяти)
+                if (list.Count == 0)
+                    _perIp.Remove(ip);
+
+                banned = _tempBans.TryGetValue(ip, out var expiry) && expiry > now;
+
+                // Мгновенный подсчёт conn/sec для эскалации в реальном времени
+                connPerSec = _connTimes.Count(t => (now - t).TotalSeconds <= 1.0);
+                _cachedConnPerSec = connPerSec;
+                _cachedConnTime = now;
+            }
+
+            // Забаненный IP
+            if (banned)
+            {
+                ev.Reject("Временно заблокировано (анти-флуд). Попробуйте позже.", true);
+                return;
+            }
+
+            // Мгновенная эскалация: если conn/sec уже превышает Layer 4 — сразу lockdown
+            // Не ждём мониторинга (он раз в секунду), а реагируем на каждое подключение
+            var level = CurrentLevel;
+            if (connPerSec >= _config.AntiDdosLayer4ConnPerSec)
+            {
+                if (level < AntiDdosLevel.Layer4)
+                    SetLevel(AntiDdosLevel.Layer4, connPerSec, Server.SmoothTps);
+                level = AntiDdosLevel.Layer4;
+            }
+            else if (connPerSec >= _config.AntiDdosLayer3ConnPerSec && level < AntiDdosLevel.Layer3)
+            {
+                SetLevel(AntiDdosLevel.Layer3, connPerSec, Server.SmoothTps);
+                level = AntiDdosLevel.Layer3;
+            }
+            else if (connPerSec >= _config.AntiDdosLayer2ConnPerSec && level < AntiDdosLevel.Layer2)
+            {
+                SetLevel(AntiDdosLevel.Layer2, connPerSec, Server.SmoothTps);
+                level = AntiDdosLevel.Layer2;
+            }
+
+            // Слой 4 — полный lockdown
+            if (level == AntiDdosLevel.Layer4)
+            {
+                ev.Reject("Сервер под DDoS-атакой. Вход временно закрыт.", true);
+                return;
+            }
+
+            // Слой 3 — только известные игроки
+            if (level == AntiDdosLevel.Layer3 && _config.AntiDdosLayer3KnownOnly)
+            {
+                bool known;
+                lock (_sync) { known = ev.UserId != null && _knownUsers.Contains(ev.UserId); }
+                if (!known)
+                {
+                    ev.Reject("Сервер перегружен. Вход открыт только вернувшимся игрокам.", true);
+                    return;
+                }
+            }
+
+            // Пер-IP лимит (Слой 1+)
+            if (level >= AntiDdosLevel.Layer1 && perIpCount > _config.AntiDdosMaxConnPerIp)
+            {
+                lock (_sync) { _tempBans[ip] = now.AddSeconds(_config.AntiDdosIpTempBanSeconds); }
+                ev.Reject("Слишком много подключений с вашего IP.", true);
+                return;
+            }
+
+            // Слой 2 — отклоняем НОВЫХ (неизвестных) игроков, известных — пропускаем
+            // Раньше был только Delay(2), что не спасало: сервер всё равно обрабатывал
+            // каждое подключение, и бэклог переполнялся.
+            if (level == AntiDdosLevel.Layer2)
+            {
+                bool known;
+                lock (_sync) { known = ev.UserId != null && _knownUsers.Contains(ev.UserId); }
+                if (!known)
+                {
+                    ev.Reject("Сервер перегружен. Попробуйте зайти позже.", true);
+                    return;
+                }
+                // Известных — пропускаем, но с задержкой
+                ev.Delay(2, false);
+            }
+        }
+
+        // ── Мониторинг ──
+        private IEnumerator<float> MonitorLoop()
+        {
+            while (true)
+            {
+                float interval = _config.AntiDdosMonitorInterval > 0f ? _config.AntiDdosMonitorInterval : 1f;
+                yield return Timing.WaitForSeconds(interval);
+
+                if (!_config.AntiDdosEnabled)
+                {
+                    if (CurrentLevel != AntiDdosLevel.Normal)
+                        SetLevel(AntiDdosLevel.Normal, 0, 0);
+                    continue;
+                }
+
+                try { Evaluate(); }
+                catch (Exception ex) { Log.Debug($"[AntiDdos] Evaluate: {ex.Message}"); }
+            }
+        }
+
+        private void Evaluate()
+        {
+            DateTime now = DateTime.UtcNow;
+            int connPerSec;
+
+            lock (_sync)
+            {
+                // Очистка старых записей
+                var cutoff = now.AddSeconds(-5.0);
+                while (_connTimes.Count > 0 && _connTimes.First.Value < cutoff)
+                    _connTimes.RemoveFirst();
+
+                connPerSec = _connTimes.Count(t => (now - t).TotalSeconds <= 1.0);
+
+                // Очистка истёкших банов
+                var expired = _tempBans.Where(kv => kv.Value <= now).Select(kv => kv.Key).ToList();
+                foreach (var k in expired) _tempBans.Remove(k);
+
+                // Очистка пустых IP-записей
+                var emptyIps = _perIp.Where(kv => kv.Value.Count == 0).Select(kv => kv.Key).ToList();
+                foreach (var k in emptyIps) _perIp.Remove(k);
+            }
+
+            double tps = Server.SmoothTps;
+
+            // Целевой слой по подключениям/сек.
+            // TPS используется ТОЛЬКО для добивания до более высокого слоя,
+            // но НЕ для самостоятельной эскалации — TPS может падать из-за
+            // тяжёлых ивентов, медицины, гранат, и это НЕ DDoS.
+            AntiDdosLevel target;
+            if (connPerSec >= _config.AntiDdosLayer4ConnPerSec)
+                target = AntiDdosLevel.Layer4;
+            else if (connPerSec >= _config.AntiDdosLayer3ConnPerSec)
+                target = AntiDdosLevel.Layer3;
+            else if (connPerSec >= _config.AntiDdosLayer2ConnPerSec)
+                target = AntiDdosLevel.Layer2;
+            else if (connPerSec >= _config.AntiDdosLayer1ConnPerSec)
+                target = AntiDdosLevel.Layer1;
+            else if (connPerSec >= _config.AntiDdosLayer3ConnPerSec / 2 && tps <= _config.AntiDdosLayer3TpsThreshold)
+                // Много подключений + TPS критически низкая → добиваем до Слоя 3
+                target = AntiDdosLevel.Layer3;
+            else if (connPerSec >= _config.AntiDdosLayer4ConnPerSec / 2 && tps <= _config.AntiDdosLayer4TpsThreshold)
+                // Очень много подключений + TPS умирает → добиваем до Слоя 4
+                target = AntiDdosLevel.Layer4;
+            else
+                target = AntiDdosLevel.Normal;
+
+            if (target > CurrentLevel)
+            {
+                // Эскалация — мгновенно
+                _calmSince = null;
+                SetLevel(target, connPerSec, tps);
+            }
+            else if (target < CurrentLevel)
+            {
+                // Деэскалация — по одному слою после периода спокойствия
+                if (_calmSince == null) _calmSince = now;
+                if ((now - _calmSince.Value).TotalSeconds >= _config.AntiDdosDeescalateSeconds)
+                {
+                    SetLevel(CurrentLevel - 1, connPerSec, tps);
+                    _calmSince = null;
+                }
+            }
+            else
+            {
+                _calmSince = null;
+            }
+        }
+
+        private void SetLevel(AntiDdosLevel level, int connPerSec, double tps)
+        {
+            if (level == CurrentLevel) return;
+            var prev = CurrentLevel;
+            CurrentLevel = level;
+            Alert(prev, level, connPerSec, tps);
+        }
+
+        private void Alert(AntiDdosLevel prev, AntiDdosLevel level, int connPerSec, double tps)
+        {
+            string msg = level switch
+            {
+                AntiDdosLevel.Normal => $"[AntiDdos] Атака отражена, возврат в норму (conn/s={connPerSec}, tps={tps:0}).",
+                AntiDdosLevel.Layer1 => $"[AntiDdos] СЛОЙ 1 (лёгкий флуд): включён per-IP лимит. conn/s={connPerSec}.",
+                AntiDdosLevel.Layer2 => $"[AntiDdos] СЛОЙ 2 (сильный флуд): отклонение новых, задержка известных. conn/s={connPerSec}.",
+                AntiDdosLevel.Layer3 => $"[AntiDdos] СЛОЙ 3 (перегрузка): вход только вернувшимся игрокам. conn/s={connPerSec}, tps={tps:0}.",
+                AntiDdosLevel.Layer4 => $"[AntiDdos] СЛОЙ 4 (LOCKDOWN): DDOS АТАКА — вход закрыт, только консоль! conn/s={connPerSec}, tps={tps:0}.",
+                _ => $"[AntiDdos] Уровень: {level}."
+            };
+
+            if (level >= AntiDdosLevel.Layer3) Log.Error(msg);
+            else if (level >= AntiDdosLevel.Layer1) Log.Warn(msg);
+            else Log.Info(msg);
+
+            SendWebhook(level, msg);
+        }
+
+        private void SendWebhook(AntiDdosLevel level, string msg)
+        {
+            string url = _config.AntiDdosWebhookUrl;
+            if (string.IsNullOrWhiteSpace(url)) return;
+
+            // Fire-and-forget — сеть не должна ронять сервер
+            Task.Run(async () =>
+            {
+                try
+                {
+                    string prefix = level == AntiDdosLevel.Layer4 ? "@here " : string.Empty;
+                    string json = "{\"content\":\"" + Escape(prefix + msg) + "\"}";
+                    using (var content = new StringContent(json, Encoding.UTF8, "application/json"))
+                        await _http.PostAsync(url, content).ConfigureAwait(false);
+                }
+                catch { }
+            });
+        }
+
+        private static string Escape(string s) =>
+            s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", " ").Replace("\r", " ");
+
+        // ── Сброс на новом раунде ──
+        // ВНИМАНИЕ: _knownUsers НЕ очищается — игроки прошлых раундов остаются "известными".
+        // Это критично для Слоя 3: если очистить, то после рестарта раунда ни один игрок
+        // не пройдёт фильтр "только известные", и легитимные игроки не смогут войти.
+        public void Reset()
+        {
+            lock (_sync)
+            {
+                _connTimes.Clear();
+                _perIp.Clear();
+                _tempBans.Clear();
+                // _knownUsers НЕ очищаем!
+            }
+            CurrentLevel = AntiDdosLevel.Normal;
+            _calmSince = null;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\AntiDdos\TrafficReportService.cs =====
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using Exiled.API.Features;
+using MEC;
+
+namespace EventHUD.AntiDdos
+{
+    public class TrafficReportService
+    {
+        private static readonly CultureInfo Ru = new CultureInfo("ru-RU");
+
+        private CoroutineHandle _handle;
+        private long _lastRxBytes = -1;
+
+        // поминутные дельты за последние 48 часов
+        private readonly List<(DateTime time, long bytes)> _minutes = new List<(DateTime, long)>();
+        // история 30-минутных окон (для среднего), в MB
+        private readonly List<double> _history30 = new List<double>();
+        private double _prevAvg30;
+
+        private static string LogPath => Path.Combine(Paths.Configs, "EventHUD", "antiddos.txt");
+        private static string TrafficFilePath => Path.Combine(Paths.Configs, "EventHUD-Traffic.txt");
+
+        public void Start()
+        {
+            LoadHistory();
+            _handle = Timing.RunCoroutine(Loop());
+        }
+
+        public void Stop() => Timing.KillCoroutines(_handle);
+
+        private IEnumerator<float> Loop()
+        {
+            int minuteCounter = 0;
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(60f);
+                try
+                {
+                    SampleMinute();
+                    minuteCounter++;
+                    if (minuteCounter >= 30)
+                    {
+                        minuteCounter = 0;
+                        ReportAuto();
+                    }
+                }
+                catch (Exception e) { WriteLog("ERROR loop: " + e.Message); }
+            }
+        }
+
+        // ==== Сбор трафика ====
+
+        private static long ReadRxBytes()
+        {
+            // /proc/net/dev: суммируем received bytes по всем интерфейсам кроме lo
+            long total = 0;
+            foreach (string line in File.ReadAllLines("/proc/net/dev").Skip(2))
+            {
+                string[] parts = line.Split(':');
+                if (parts.Length != 2) continue;
+                if (parts[0].Trim() == "lo") continue;
+
+                string[] cols = parts[1].Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (cols.Length > 0 && long.TryParse(cols[0], out long rx))
+                    total += rx;
+            }
+            return total;
+        }
+
+        private void SampleMinute()
+        {
+            long rx = ReadRxBytes();
+            if (_lastRxBytes >= 0)
+            {
+                long delta = rx - _lastRxBytes;
+                if (delta < 0) delta = 0; // счётчик сбросился
+                _minutes.Add((DateTime.UtcNow, delta));
+                if (_minutes.Count > 2880) _minutes.RemoveAt(0);
+            }
+            _lastRxBytes = rx;
+        }
+
+        private double WindowMb(int minutes, int offsetMinutes = 0)
+        {
+            DateTime to = DateTime.UtcNow.AddMinutes(-offsetMinutes);
+            DateTime from = to.AddMinutes(-minutes);
+            long sum = 0;
+            foreach (var m in _minutes)
+                if (m.time > from && m.time <= to)
+                    sum += m.bytes;
+            return sum / 1024.0 / 1024.0;
+        }
+
+        // ==== Форматирование ====
+
+        private static string FmtSize(double mb) =>
+            mb >= 1024 ? (mb / 1024).ToString("0.##", Ru) + " GB" : mb.ToString("0", Ru) + " MB";
+
+        private static string FmtPct(double pct)
+        {
+            if (Math.Abs(pct) < 5) return "0%"; // 3-4% не считается
+            return (pct >= 0 ? "+" : "-") + Math.Abs(pct).ToString("0.##", Ru) + "%";
+        }
+
+        private static string Emoji(double valueMb, double avgMb)
+        {
+            if (avgMb <= 0) return "\U0001F7E9";   // зелёный: нет статистики - считаем нормой
+            double r = valueMb / avgMb;
+            if (r >= 100) return "\u2B1B";          // чёрный: крайне много
+            if (r >= 15) return "\U0001F7E5";      // красный: очень много
+            if (r >= 2.5) return "\U0001F7E8";     // жёлтый: много
+            if (r <= 0.5) return "\u2B1C";          // белый: маловато
+            return "\U0001F7E9";                    // зелёный: норма
+        }
+
+        private string BuildBlock(string title, int minutes)
+        {
+            double cur = WindowMb(minutes);
+            double prev = WindowMb(minutes, minutes);
+            double avg30 = _history30.Count > 0 ? _history30.Average() : 0;
+            double avg = avg30 * (minutes / 30.0); // норма для этого окна
+
+            double pctPrev = prev > 0 ? (cur - prev) / prev * 100.0 : 0;
+            double pctAvg = avg > 0 ? (cur - avg) / avg * 100.0 : 0;
+
+            double avgDelta = (avg30 - _prevAvg30) * (minutes / 30.0);
+            string avgDeltaStr = Math.Abs(avgDelta) < 0.5
+                ? ""
+                : $" [ {(avgDelta >= 0 ? "+" : "-")}{FmtSize(Math.Abs(avgDelta))} ]";
+
+            return
+                $"Aceline Events STATUS [ {title} ]\n" +
+                $"Получено: {FmtSize(cur)} трафика {Emoji(cur, avg)}\n" +
+                $"{FmtPct(pctPrev)} от прошлого раза | {FmtPct(pctAvg)} от среднего\n" +
+                $"Средний трафик: {FmtSize(avg)}{avgDeltaStr}";
+        }
+
+        // ==== Отчёты ====
+
+        /// Автоотчёт раз в 30 минут.
+        private void ReportAuto()
+        {
+            string block = BuildBlock("30 мин", 30);
+
+            // обновляем историю среднего ПОСЛЕ построения отчёта
+            _prevAvg30 = _history30.Count > 0 ? _history30.Average() : 0;
+            double cur = WindowMb(30);
+            _history30.Add(cur);
+            if (_history30.Count > 336) _history30.RemoveAt(0); // храним неделю
+            WriteLog("WINDOW30 " + cur.ToString("0.##", CultureInfo.InvariantCulture) + " MB");
+
+            WriteLog(block.Replace("\n", " | "));
+            SendToBot(block);
+        }
+
+        /// Ручной отчёт по /serverstatus: 30 мин + 2 часа + 24 часа.
+        public void SendManualReport()
+        {
+            string text =
+                BuildBlock("30 мин", 30) + "\n\n" +
+                BuildBlock("2 часа", 120) + "\n\n" +
+                BuildBlock("24 часа", 1440);
+
+            WriteLog("MANUAL /serverstatus запрошен");
+            SendToBot(text);
+        }
+
+        // Кладём отчёт в файл, бот подхватит и запостит в канал
+        private static void SendToBot(string text)
+        {
+            try
+            {
+                File.AppendAllText(TrafficFilePath, text + "\n-----\n");
+            }
+            catch (Exception e) { Log.Warn("[Traffic] " + e.Message); }
+        }
+
+        // ==== antiddos.txt ====
+
+        private static void WriteLog(string msg)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(LogPath);
+                Directory.CreateDirectory(dir);
+                File.AppendAllText(LogPath, $"[{DateTime.Now:dd.MM HH:mm:ss}] {msg}{Environment.NewLine}");
+            }
+            catch { }
+        }
+
+        private void LoadHistory()
+        {
+            try
+            {
+                if (!File.Exists(LogPath)) return;
+                string[] allLines = File.ReadAllLines(LogPath);
+                for (int idx = allLines.Length - 1; idx >= 0 && idx > allLines.Length - 1500; idx--)
+                {
+                    string line = allLines[idx];
+                    int i = line.IndexOf("WINDOW30 ", StringComparison.Ordinal);
+                    if (i < 0) continue;
+                    string num = line.Substring(i + 9).Replace(" MB", "").Trim();
+                    if (double.TryParse(num, NumberStyles.Float, CultureInfo.InvariantCulture, out double mb))
+                        _history30.Insert(0, mb);
+                    if (_history30.Count >= 336) break;
+                }
+                WriteLog($"START: загружено {_history30.Count} окон истории");
+            }
+            catch { }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Audio\FileLog.cs =====
+using System;
+using System.IO;
+using Exiled.API.Features;
+
+namespace EventHUD.Audio
+{
+    /// <summary>
+    /// Логгер в файл Configs/EventHUD/Audio/log.txt —
+    /// для диагностики без доступа к консоли сервера.
+    /// </summary>
+    public static class FileLog
+    {
+        private static readonly object Sync = new object();
+
+        public static string LogPath =>
+            Path.Combine(Paths.Configs, "EventHUD", "Audio", "log.txt");
+
+        public static void Write(string message)
+        {
+            try
+            {
+                lock (Sync)
+                {
+                    Directory.CreateDirectory(
+                        Path.GetDirectoryName(LogPath));
+
+                    File.AppendAllText(
+                        LogPath,
+                        $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
+                }
+            }
+            catch
+            {
+                // Файловый лог не должен ронять плагин
+            }
+        }
+
+        /// <summary>Очистить лог (вызывается при старте раунда/плагина).</summary>
+        public static void Clear()
+        {
+            try
+            {
+                lock (Sync)
+                {
+                    Directory.CreateDirectory(
+                        Pat

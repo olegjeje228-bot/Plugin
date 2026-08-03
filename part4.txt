@@ -1,0 +1,566 @@
+ switch
+        {
+            RPType.NONRP    => "<@&1525359474724835440>",
+            RPType.FUNRP    => "<@&1525359474724835440>",
+            RPType.LIGHTRP  => "<@&1525360019674103818>",
+            RPType.MEDIUMRP => "<@&1525360019674103818>",
+            RPType.HARDRP   => "<@&1525360019674103818>",
+            RPType.FULLRP   => "<@&1525360171541594183>",
+            _               => string.Empty
+        };
+
+        public static string FormatTimeSpan(TimeSpan t) =>
+            t.TotalHours >= 1   ? $"{(int)t.TotalHours} ч {t.Minutes} мин"
+            : t.TotalMinutes >= 1 ? $"{(int)t.TotalMinutes} мин"
+            : $"{Math.Max(0, t.Seconds)} сек";
+
+        // ---------- Анонсы-embed ----------
+
+        public static void SendPrepareEmbed(EventSession s)
+        {
+            long prepStart = ToUnix(s.StartedAt);
+
+            Post(new
+            {
+                content = GetRolePing(s.RpType),
+                allowed_mentions = new { parse = new[] { "roles", "users" } },
+                embeds = new object[]
+                {
+                    new
+                    {
+                        title = s.EventName?.ToUpperInvariant(),
+                        description = HostLine("Проводит", s),
+                        color = ColorInt(s.RpType),
+                        fields = new object[]
+                        {
+                            Field("Уровень РП", s.RpType.GetShortName()),
+                            Field("Подготовка", $"началась <t:{prepStart}:R>"),
+                            Field("Онлайн", OnlineCount.ToString()),
+                        },
+                        footer = new { text = "Aceline Events" },
+                        timestamp = DateTime.UtcNow.ToString("o"),
+                    }
+                }
+            });
+        }
+
+        public static void SendStartEmbed(EventSession s, TimeSpan prepTime)
+        {
+            Post(new
+            {
+                allowed_mentions = new { parse = new[] { "users" } },
+                embeds = new object[]
+                {
+                    new
+                    {
+                        title = s.EventName?.ToUpperInvariant(),
+                        description = HostLine("Начался! Проводит", s),
+                        color = ColorInt(s.RpType),
+                        fields = new object[]
+                        {
+                            Field("Уровень РП", s.RpType.GetShortName()),
+                            Field("Подготовка заняла", FormatTimeSpan(prepTime)),
+                            Field("Онлайн", OnlineCount.ToString()),
+                        },
+                        footer = new { text = "Aceline Events" },
+                        timestamp = DateTime.UtcNow.ToString("o"),
+                    }
+                }
+            });
+        }
+
+        public static void SendStopEmbed(EventSession s, TimeSpan duration)
+        {
+            Post(new
+            {
+                allowed_mentions = new { parse = new[] { "users" } },
+                embeds = new object[]
+                {
+                    new
+                    {
+                        title = s.EventName?.ToUpperInvariant(),
+                        description = HostLine("Завершён. Проводил", s),
+                        color = ColorInt(s.RpType),
+                        fields = new object[]
+                        {
+                            Field("Длительность", FormatTimeSpan(duration)),
+                            Field("Онлайн", OnlineCount.ToString()),
+                        },
+                        footer = new { text = "Aceline Events" },
+                        timestamp = DateTime.UtcNow.ToString("o"),
+                    }
+                }
+            });
+        }
+
+        public static void Send(string content) =>
+            Post(new { content, allowed_mentions = new { parse = new[] { "roles" } } });
+
+        public static void SendTo(string url, string content)
+        {
+            if (string.IsNullOrWhiteSpace(url))
+                return;
+
+            _ = PostAsync(url, new { content, allowed_mentions = new { parse = new string[0] } });
+        }
+
+        public static void SendCallAlert(string message)
+        {
+            string url = Plugin.Instance?.Config?.CallWebhookUrl;
+            if (string.IsNullOrEmpty(url))
+                return;
+
+            var payload = new
+            {
+                content = "<@&1525372694542024795>",
+                allowed_mentions = new { parse = new[] { "roles" } },
+                embeds = new object[]
+                {
+                    new
+                    {
+                        description = message,
+                        color = 0xE74C3C,
+                    }
+                }
+            };
+            _ = PostAsync(url, payload);
+        }
+
+        // ---------- Внутрянка ----------
+
+        private static object Field(string name, string value) =>
+            new { name, value, inline = true };
+
+        private static string HostLine(string prefix, EventSession s)
+        {
+            string mention = HostMention(s.HostUserId);
+            return mention == null
+                ? $"{prefix} **{s.HostNickname}**"
+                : $"{prefix} **{s.HostNickname}** ({mention})";
+        }
+
+        private static string HostMention(string userId)
+        {
+            if (string.IsNullOrEmpty(userId))
+                return null;
+
+            string steamId = userId.Replace("@steam", string.Empty).Replace("@northwood", string.Empty);
+            var map = Plugin.Instance?.Config?.HostDiscordIds;
+            return map != null && map.TryGetValue(steamId, out ulong id) ? $"<@{id}>" : null;
+        }
+
+        private static int ColorInt(RPType type) =>
+            Convert.ToInt32(type.GetColor().TrimStart('#'), 16);
+
+        private static long ToUnix(DateTime utc) =>
+            new DateTimeOffset(utc == default ? DateTime.UtcNow : utc, TimeSpan.Zero).ToUnixTimeSeconds();
+
+        private static void Post(object payload)
+        {
+            string url = WebhookUrl;
+            if (string.IsNullOrWhiteSpace(url))
+            {
+                Log.Warn("[EventHUD] Discord webhook URL не задан в конфиге.");
+                return;
+            }
+
+            _ = PostAsync(url, payload);
+        }
+
+        private static async Task PostAsync(string url, object payload)
+        {
+            try
+            {
+                string json = JsonConvert.SerializeObject(payload);
+                using (var content = new StringContent(json, Encoding.UTF8, "application/json"))
+                {
+                    HttpResponseMessage resp = await Client.PostAsync(url, content).ConfigureAwait(false);
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        string body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        Log.Warn($"[EventHUD] Webhook HTTP {(int)resp.StatusCode}: {body}");
+                        Logging.DebugFileLog.Write($"[Webhook] HTTP {(int)resp.StatusCode}: {body}");
+                    }
+                    else
+                    {
+                        Logging.DebugFileLog.Write("[Webhook] Отправлено OK.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"[EventHUD] Webhook error: {ex.Message}");
+                Logging.DebugFileLog.Write($"[Webhook] ОШИБКА: {ex}");
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\EventManager.cs =====
+using System;
+using System.Collections.Generic;
+using CommandSystem;
+using EventHUD.Enums;
+using EventHUD.Extensions;
+using EventHUD.Models;
+using EventHUD.Elevator;
+using EventHUD.Radio;
+using EventHUD.Rpm;
+using Exiled.API.Features;
+using MEC;
+
+namespace EventHUD
+{
+    public class EventManager
+    {
+        public static EventManager Instance { get; } = new EventManager();
+
+        public EventSession Session        { get; } = new EventSession();
+        public DateTime     LastRaActivity { get; private set; } = DateTime.UtcNow;
+
+        private CoroutineHandle _transitionHandle;
+        private CoroutineHandle _stopHandle;
+
+        public void Prepare(string eventName, RPType rpType, ICommandSender sender)
+        {
+            Player player = Player.Get(sender);
+
+            Timing.KillCoroutines(_transitionHandle, _stopHandle);
+
+            Session.Reset();
+
+            Session.State        = EventState.Preparing;
+            Session.EventName    = eventName;
+            Session.RpType       = rpType;
+            Session.HostUserId   = player?.UserId;
+            Session.HostNickname = player?.Nickname ?? "Консоль";
+            Session.StartedAt    = DateTime.UtcNow;
+
+            RpModuleManager.Instance.OnEventRpChanged(rpType);
+            NotifyRaActivity();
+
+            ServerNameService.SetStatus($"Подготовка ивента: {Session.EventName}", Session.RpType.GetColor());
+
+            DiscordBotService.SendPrepare(eventName, rpType, Session.HostNickname);
+            DiscordWebhookService.SendPrepareEmbed(Session);
+        }
+
+        public bool Start(Player invoker, RPType? rpType, string eventName, out string message)
+        {
+            if (Session.State == EventState.None)
+            {
+                message = "Сначала используйте ev prepare!";
+                return false;
+            }
+
+            if (rpType.HasValue)
+                Session.RpType = rpType.Value;
+
+            if (!string.IsNullOrWhiteSpace(eventName))
+                Session.EventName = eventName;
+
+            if (invoker != null)
+            {
+                Session.HostUserId   = invoker.UserId;
+                Session.HostNickname = invoker.Nickname;
+                Session.HostIsOnline = true;
+            }
+
+            // Время подготовки считаем до обновления Session.StartedAt
+            TimeSpan prepTime = Session.StartedAt == default
+                ? TimeSpan.Zero
+                : DateTime.UtcNow - Session.StartedAt;
+
+            Session.State     = EventState.Starting;
+            Session.StartedAt = DateTime.UtcNow;
+
+            if (rpType.HasValue)
+                RpModuleManager.Instance.OnEventRpChanged(rpType.Value);
+
+            NotifyRaActivity();
+
+            // Auto-enable elevator breaks for RP events (all except NONRP)
+            bool isRp =
+                Session.RpType != RPType.NONRP;
+
+            if (Plugin.Instance.Config.ElevatorAutoEnableForRp && isRp)
+                Plugin.Instance.ElevatorBreaks?.Enable();
+            else
+                Plugin.Instance.ElevatorBreaks?.Disable(true);
+
+            Timing.KillCoroutines(_transitionHandle);
+            _transitionHandle = Timing.RunCoroutine(TransitionToRunning());
+
+            message = $"Ивент запущен: {Session.EventName} [{Session.RpType.GetShortName()}]";
+
+            ServerNameService.SetStatus($"Идёт ивент: {Session.EventName}", Session.RpType.GetColor());
+
+            DiscordBotService.SendStart(Session.EventName, Session.RpType, Session.HostNickname, prepTime);
+            DiscordWebhookService.SendStartEmbed(Session, prepTime);
+
+            return true;
+        }
+
+        public bool Stop(Player invoker, out string message)
+        {
+            if (Session.State == EventState.None)
+            {
+                message = "Нет активного ивента.";
+                return false;
+            }
+
+            Plugin.Instance.ElevatorBreaks?.Disable(true);
+            Backpack.BackpackSystem.Instance?.CloseAllOpen();
+
+            Session.State     = EventState.Stopping;
+            Session.StoppedAt = DateTime.UtcNow;
+
+            if (invoker != null)
+            {
+                Session.HostNickname = invoker.Nickname;
+                Session.HostUserId   = invoker.UserId;
+            }
+            else
+            {
+                Session.HostNickname = "Консоль";
+                Session.HostUserId   = null;
+            }
+
+            RpModuleManager.Instance.OnEventStopped(Session.RpType);
+            EventWaveStorage.ClearAll();
+            NotifyRaActivity();
+
+            Timing.KillCoroutines(_stopHandle);
+            _stopHandle = Timing.RunCoroutine(ClearAfterStop());
+
+            message = "Ивент остановлен.";
+
+            TimeSpan duration = Session.StartedAt == default
+                ? TimeSpan.Zero
+                : Session.StoppedAt - Session.StartedAt;
+
+            ServerNameService.Reset();
+
+            DiscordBotService.SendStop(Session.EventName, Session.RpType, Session.HostNickname, duration);
+            DiscordWebhookService.SendStopEmbed(Session, duration);
+
+            return true;
+        }
+
+        public void OnPlayerLeft(Player player)
+        {
+            if (Session.State == EventState.None || player == null)
+                return;
+
+            if (player.UserId == Session.HostUserId)
+                Session.HostIsOnline = false;
+        }
+
+        public void OnPlayerJoined(Player player)
+        {
+            if (Session.State == EventState.None || player == null)
+                return;
+
+            if (player.UserId == Session.HostUserId && !Session.HostIsOnline)
+            {
+                Session.HostIsOnline           = true;
+                Session.HostReturnedAt         = DateTime.UtcNow;
+                Session.ShowHostReturnHighlight = true;
+            }
+        }
+
+        public void NotifyRaActivity() => LastRaActivity = DateTime.UtcNow;
+
+        public bool IsAfk(int thresholdSeconds) =>
+            Session.State != EventState.None &&
+            (DateTime.UtcNow - LastRaActivity).TotalSeconds >= thresholdSeconds;
+
+        private IEnumerator<float> TransitionToRunning()
+        {
+            yield return Timing.WaitForSeconds(1f);
+
+            if (Session.State == EventState.Starting)
+                Session.State = EventState.Running;
+        }
+
+        private IEnumerator<float> ClearAfterStop()
+        {
+            yield return Timing.WaitForSeconds(Plugin.Instance.Config.StopLingerSeconds);
+
+            if (Session.State == EventState.Stopping)
+                Session.Reset();
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\ExplosionItemCleanup.cs =====
+using System;
+using System.Linq;
+using EventHUD.SpecItems;
+using Exiled.API.Features;
+using Exiled.API.Features.Pickups;
+using Exiled.Events.EventArgs.Map;
+using MapEvents = Exiled.Events.Handlers.Map;
+
+namespace EventHUD
+{
+    /// <summary>
+    /// Анти-лаг: при взрыве осколочной гранаты убирает часть валяющихся предметов,
+    /// чтобы физика взрыва не расшвыривала сотни объектов.
+    /// 100+ предметов -> удаляем 50%, 250+ -> 75%, 500+ -> 90%.
+    /// </summary>
+    public static class ExplosionItemCleanup
+    {
+        private static readonly Random Rng = new Random();
+
+        public static void Register() => MapEvents.ExplodingGrenade += OnExplodingGrenade;
+
+        public static void Unregister() => MapEvents.ExplodingGrenade -= OnExplodingGrenade;
+
+        private static void OnExplodingGrenade(ExplodingGrenadeEventArgs ev)
+        {
+            try
+            {
+                // Только осколочная (флешки и SCP-018 не трогаем)
+                if (ev.Projectile == null || ev.Projectile.Type != ItemType.GrenadeHE)
+                    return;
+
+                var pickups = Pickup.List
+                    .Where(p => p != null && p.GameObject != null && !SpecGrenadeTag.HasTag(p.GameObject))
+                    .ToList();
+                int total = pickups.Count;
+
+                float fraction;
+                if (total >= 500)
+                    fraction = 0.90f;
+                else if (total >= 250)
+                    fraction = 0.75f;
+                else if (total >= 100)
+                    fraction = 0.50f;
+                else
+                    return;
+
+                int toRemove = (int)(total * fraction);
+
+                // Перемешиваем, чтобы удалялись случайные, а не первые попавшиеся
+                for (int i = pickups.Count - 1; i > 0; i--)
+                {
+                    int j = Rng.Next(i + 1);
+                    var tmp = pickups[i];
+                    pickups[i] = pickups[j];
+                    pickups[j] = tmp;
+                }
+
+                int removed = 0;
+                for (int i = 0; i < toRemove && i < pickups.Count; i++)
+                {
+                    try
+                    {
+                        pickups[i].Destroy();
+                        removed++;
+                    }
+                    catch
+                    {
+                        // отдельный битый пикап не должен ломать чистку
+                    }
+                }
+
+                Log.Info($"[ItemCleanup] Взрыв гранаты: предметов на карте {total}, удалено {removed}");
+            }
+            catch (Exception e)
+            {
+                Log.Warn($"[ItemCleanup] Ошибка: {e.Message}");
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Plugin.cs =====
+using System;
+using System.Linq;
+using EventHUD.AntiAdm;
+using EventHUD.AntiDdos;
+using EventHUD.Backpack;
+using EventHUD.EventHandlers;
+using EventHUD.Hud;
+using EventHUD.Medicine;
+using EventHUD.Radio;
+using EventHUD.Elevator;
+using EventHUD.Rpm;
+using EventHUD.Scp;
+using EventHUD.Cube;
+using EventHUD.SpecItems;
+using Exiled.CustomItems.API;
+using Exiled.API.Features;
+
+namespace EventHUD
+{
+    public class Plugin : Plugin<Config>
+    {
+        public static Plugin Instance { get; private set; }
+
+        public override string Name    => "EventHUD";
+        public override string Author  => "rustam";
+        public override Version Version => new Version(1, 2, 0);
+        public override Version RequiredExiledVersion => new Version(9, 14, 2);
+
+        public EffectScheduler Effects       { get; private set; }
+        public HudCompositor   Hud           { get; private set; }
+        public InjuryTickService InjuryTicks  { get; private set; }
+        public MedkitHealService MedkitHeals  { get; private set; }
+        public CriticalStateService CritState { get; private set; }
+        public BodyStunTickService StunTicks   { get; private set; }
+        public RegenTickService RegenTicks   { get; private set; }
+
+        private PlayerEventHandlers      _handlers;
+        private RadioEventHandlers       _radioHandlers;
+        private RadioBroadcastFilter     _radioFilter;
+        private ScpProximityVoiceFilter  _scpProximityVoiceFilter;
+        private MedicineEventHandlers    _medicineHandlers;
+        public AntiAdmCommandHandler    AntiAdmCommands;
+        private AntiAdmGrenadeHandler    _antiAdmGrenades;
+
+        public AntiAdmGrenadeDensityService AntiAdmGrenadeDensity { get; private set; }
+        public AntiAdmAntiLagService AntiLag { get; private set; }
+        public AntiDdosService AntiDdos { get; private set; }
+        public TpsOptimizerService TpsOptimizer { get; private set; }
+        public Discord.OnlineStatusService OnlineStatus;
+        public Discord.BotCommandService BotCommands;
+        public Medicine.SimpleMedkitService SimpleMedkit;
+
+        public Scp106Handler Scp106 { get; private set; }
+        public Scp049Handler Scp049 { get; private set; }
+        public Scp3114Handler Scp3114 { get; private set; }
+        public Scp914Handler Scp914 { get; private set; }
+        public Scp096Handler Scp096 { get; private set; }
+        public AloneDummyService AloneDummy { get; private set; }
+        public HczArmoryService HczArmory { get; private set; }
+        public HelicopterCrushService HelicopterCrush { get; private set; }
+        public ScpTeslaProtectionService ScpTeslaProtection { get; private set; }
+        public ElevatorBreakSystem ElevatorBreaks { get; private set; }
+        public CubeLootSystem CubeLoot { get; private set; }
+        public Radio.RadioFmSystem RadioFm { get; private set; }
+        public AntiDdos.TrafficReportService TrafficReport { get; private set; }
+        public Cube.SecondLifeSystem SecondLife { get; private set; }
+        public Norma.NormaSystem Norma { get; private set; }
+
+        private BreakerGun breakerGun;
+        private GrenadeLauncher grenadeLauncher;
+        private GrenadeLauncherRp grenadeLauncherRp;
+
+        public override void OnEnabled()
+        {
+            Instance = this;
+
+            Ai.AiPermissions.Load();
+            Ai.AiModelStore.Load();
+
+            HudToggleService.Initialize(Config.HudEnabledByDefault);
+
+            Effects           = new EffectScheduler(Config);
+            Hud               = new HudCompositor(Config, Effects);
+            InjuryTicks       = new InjuryTickService();
+            MedkitHeals       = new MedkitHealService();
+            CritState         = new CriticalStateService();
+            StunTicks         = new BodyStunTickService();
+            Rege

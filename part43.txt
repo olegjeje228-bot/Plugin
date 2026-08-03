@@ -1,0 +1,593 @@
+oundStarted;
+
+            States.Clear();
+        }
+
+        private static void OnRoundStarted()
+        {
+            States.Clear();
+        }
+
+        private static void OnChangingRole(ChangingRoleEventArgs ev)
+        {
+            if (ev.Player != null)
+                States.Remove(ev.Player.UserId);
+        }
+
+        private static DocState Get(Player player)
+        {
+            if (!States.TryGetValue(
+                    player.UserId,
+                    out DocState state))
+            {
+                state = new DocState();
+                States[player.UserId] = state;
+            }
+
+            return state;
+        }
+
+        private static void OnHurting(HurtingEventArgs ev)
+        {
+            if (ev.Player == null ||
+                ev.Player.Role.Type != RoleTypeId.Scp049)
+            {
+                return;
+            }
+
+            DocState state = Get(ev.Player);
+
+            if (ev.DamageHandler.Type == DamageType.Explosion)
+            {
+                state.Condition = Doc049Condition.Concussion;
+                state.HealProgress = 0f;
+
+                ev.Player.EnableEffect(
+                    EffectType.Concussed,
+                    8f);
+
+                return;
+            }
+
+            if (ev.DamageHandler.Type == DamageType.MicroHid ||
+                ev.DamageHandler.Type == DamageType.Tesla)
+            {
+                state.Condition = Doc049Condition.Burn;
+                state.HealProgress = 0f;
+                return;
+            }
+
+            if (!(ev.DamageHandler.Base is FirearmDamageHandler))
+                return;
+
+            DateTime now = DateTime.UtcNow;
+
+            if ((now - state.LastSlowness).TotalSeconds >= 1.0)
+            {
+                state.LastSlowness = now;
+
+                ev.Player.ChangeEffectIntensity(
+                    EffectType.Slowness,
+                    25,
+                    1f);
+            }
+
+            if ((now - state.WindowStart).TotalSeconds >
+                WoundWindowSeconds)
+            {
+                state.WindowStart = now;
+                state.WindowDamage = 0f;
+            }
+
+            state.WindowDamage += ev.Amount;
+
+            if (state.WindowDamage >= WoundDamageThreshold &&
+                state.Condition == Doc049Condition.None)
+            {
+                state.Condition = Doc049Condition.Wound;
+                state.HealProgress = 0f;
+            }
+        }
+
+        public static void Tick(Player player, float deltaTime)
+        {
+            if (player == null ||
+                player.Role.Type != RoleTypeId.Scp049)
+            {
+                return;
+            }
+
+            DocState state = Get(player);
+
+            if (state.RegenLeft > 0f)
+            {
+                float regeneration =
+                    Math.Min(
+                        state.RegenLeft,
+                        100f / 120f * deltaTime);
+
+                player.Health = Math.Min(
+                    player.MaxHealth,
+                    player.Health + regeneration);
+
+                state.RegenLeft -= regeneration;
+            }
+
+            if (state.Condition == Doc049Condition.None)
+                return;
+
+            switch (state.Condition)
+            {
+                case Doc049Condition.Burn:
+                    player.ChangeEffectIntensity(
+                        EffectType.Slowness,
+                        35,
+                        deltaTime + 0.5f);
+
+                    player.EnableEffect(
+                        EffectType.Invigorated,
+                        deltaTime + 0.5f);
+                    break;
+
+                case Doc049Condition.Wound:
+                    player.ChangeEffectIntensity(
+                        EffectType.Slowness,
+                        25,
+                        deltaTime + 0.5f);
+
+                    if (player.Role is Scp049Role role &&
+                        role.IsCallActive)
+                    {
+                        role.RemainingCallDuration = 0.1f;
+                    }
+
+                    break;
+            }
+
+            if (player.CurrentItem?.Type != ItemType.Medkit)
+            {
+                state.HealProgress = 0f;
+                return;
+            }
+
+            state.HealProgress += deltaTime;
+
+            if (state.HealProgress <
+                GetHealDuration(state.Condition))
+            {
+                return;
+            }
+
+            if (state.Condition == Doc049Condition.Concussion)
+            {
+                player.DisableEffect(EffectType.Concussed);
+                state.RegenLeft = 100f;
+            }
+
+            player.DisableEffect(EffectType.Slowness);
+            player.DisableEffect(EffectType.Invigorated);
+
+            state.Condition = Doc049Condition.None;
+            state.HealProgress = 0f;
+            state.WindowDamage = 0f;
+            state.WindowStart = DateTime.MinValue;
+        }
+
+        public static bool IsAbilityBlocked(Player player)
+        {
+            if (player == null)
+                return false;
+
+            return States.TryGetValue(
+                       player.UserId,
+                       out DocState state) &&
+                   state.Condition == Doc049Condition.Wound;
+        }
+
+        public static string GetHudLine(Player player)
+        {
+            if (player == null ||
+                !States.TryGetValue(
+                    player.UserId,
+                    out DocState state) ||
+                state.Condition == Doc049Condition.None)
+            {
+                return string.Empty;
+            }
+
+            string name;
+            string color;
+
+            switch (state.Condition)
+            {
+                case Doc049Condition.Concussion:
+                    name = "Контузия";
+                    color = "#FF9800";
+                    break;
+
+                case Doc049Condition.Burn:
+                    name = "Ожог";
+                    color = "#FF5722";
+                    break;
+
+                default:
+                    name = "Ранение";
+                    color = "#F44336";
+                    break;
+            }
+
+            float healDuration =
+                GetHealDuration(state.Condition);
+
+            int percentage =
+                (int)(state.HealProgress / healDuration * 100f);
+
+            if (percentage < 0)
+                percentage = 0;
+
+            if (percentage > 100)
+                percentage = 100;
+
+            string healing = state.HealProgress > 0f
+                ? $" | Лечение: {percentage}%"
+                : " | Возьми аптечку в руки";
+
+            string blocked =
+                state.Condition == Doc049Condition.Wound
+                    ? " | Способность F заблокирована"
+                    : string.Empty;
+
+            return
+                $"<color={color}>{name}</color>" +
+                healing +
+                blocked;
+        }
+
+        private static float GetHealDuration(
+            Doc049Condition condition)
+        {
+            return condition switch
+            {
+                Doc049Condition.Concussion => 10f,
+                Doc049Condition.Burn => 15f,
+                _ => 20f
+            };
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Scp\Scp049Handler.cs =====
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Exiled.API.Features;
+using Exiled.API.Features.Items;
+using Exiled.API.Features.Pickups;
+using Exiled.API.Features.Roles;
+using Exiled.Events.EventArgs.Player;
+using MEC;
+using PlayerRoles;
+using UnityEngine;
+using UserSettings.ServerSpecific;
+using EventHUD.Hud;
+using EventHUD.Medicine;
+using EventHUD.Rpm;
+
+namespace EventHUD.Scp
+{
+    public class Scp049Handler
+    {
+        private readonly Config _config;
+        private static bool _registered;
+
+        private static int _pickupKeybindId  = 9030;
+        private static int _keycardKeybindId = 9031;
+        private static int _medkitKeybindId  = 9032;
+        private static int _grenadeKeybindId = 9033;
+        private static int _weapon1KeybindId = 9034;
+        private static int _weapon2KeybindId = 9035;
+
+        private const int MenuLeftId  = 9010;
+        private const int MenuRightId = 9011;
+        private const int MenuEnterId = 9012;
+
+        private class PickupState
+        {
+            public bool IsPicking;
+            public float Elapsed;
+            public float Duration;
+            public string ItemName;
+        }
+
+        private class MenuState
+        {
+            public bool IsOpen;
+            public int SelectedIndex;
+        }
+
+        private readonly Dictionary<string, List<ItemType>> _inventory = new();
+        private readonly Dictionary<string, PickupState> _pickups = new();
+        private readonly Dictionary<string, MenuState> _menus = new();
+        private readonly Dictionary<string, ushort> _equippedSerial = new();
+        private readonly Dictionary<string, int> _equippedIndex = new();
+        private readonly Dictionary<string, double> _equipTime = new();
+        private CoroutineHandle _abilityLoop;
+
+        public Scp049Handler(Config config) => _config = config;
+
+        public void Start()
+        {
+            _abilityLoop = Timing.RunCoroutine(AbilityLoop());
+        }
+
+        public void Stop()
+        {
+            Timing.KillCoroutines(_abilityLoop);
+        }
+
+        private IEnumerator<float> AbilityLoop()
+        {
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(0.2f);
+
+                if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                    continue;
+
+                foreach (Player player in Player.List)
+                {
+                    if (player == null || !player.IsAlive) continue;
+                    if (!(player.Role is Scp049Role scp049)) continue;
+
+                    Scp049ConditionService.Tick(player, 0.2f);
+
+                    if (Scp049ConditionService.IsAbilityBlocked(player))
+                    {
+                        if (scp049.IsCallActive)
+                            scp049.RemainingCallDuration = 0.1f;
+                        continue;
+                    }
+
+                    // ── Сверка инвентаря ──
+                    string uid = player.UserId;
+
+                    // 1) Выданный предмет пропал из рук не через дроп -> снимаем маппинг
+                    if (_equippedSerial.TryGetValue(uid, out ushort eqSerial) &&
+                        !player.Items.Any(i => i != null && i.Serial == eqSerial))
+                    {
+                        _equippedSerial.Remove(uid);
+                        _equippedIndex.Remove(uid);
+                    }
+
+                    // 2) Чужие предметы удаляем ТОЛЬКО спустя 1с после последней выдачи
+                    bool grace = _equipTime.TryGetValue(uid, out double t) && Timing.LocalTime - t < 1.0;
+                    if (!grace)
+                    {
+                        foreach (var item in player.Items.ToList())
+                        {
+                            if (item == null) continue;
+                            if (_equippedSerial.TryGetValue(uid, out ushort s) && item.Serial == s) continue;
+                            try { player.RemoveItem(item); } catch { }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ═════════════ SSS ═════════════
+
+        public void RegisterSss()
+        {
+            if (_registered) return;
+            _registered = true;
+
+            var pickup = new SSKeybindSetting(_pickupKeybindId, "Взять предмет (SCP-049)", UnityEngine.KeyCode.E);
+            var keycard = new SSKeybindSetting(_keycardKeybindId, "Карточка (SCP-049)", UnityEngine.KeyCode.LeftControl);
+            var medkit = new SSKeybindSetting(_medkitKeybindId, "Аптечка (SCP-049)", UnityEngine.KeyCode.X);
+            var grenade = new SSKeybindSetting(_grenadeKeybindId, "Граната (SCP-049)", UnityEngine.KeyCode.G);
+            var weapon1 = new SSKeybindSetting(_weapon1KeybindId, "Оружие 1 (SCP-049)", UnityEngine.KeyCode.Alpha1);
+            var weapon2 = new SSKeybindSetting(_weapon2KeybindId, "Оружие 2 (SCP-049)", UnityEngine.KeyCode.Alpha2);
+
+            SssRoleSync.Scp049Settings.Add(pickup);
+            SssRoleSync.Scp049Settings.Add(keycard);
+            SssRoleSync.Scp049Settings.Add(medkit);
+            SssRoleSync.Scp049Settings.Add(grenade);
+            SssRoleSync.Scp049Settings.Add(weapon1);
+            SssRoleSync.Scp049Settings.Add(weapon2);
+
+            ServerSpecificSettingsSync.ServerOnSettingValueReceived += OnSettingChanged;
+        }
+
+        public void UnregisterSss()
+        {
+            if (!_registered) return;
+            _registered = false;
+            ServerSpecificSettingsSync.ServerOnSettingValueReceived -= OnSettingChanged;
+        }
+
+        private void OnSettingChanged(ReferenceHub hub, ServerSpecificSettingBase setting)
+        {
+            int id = setting.SettingId;
+            bool ours = id == _pickupKeybindId || id == _keycardKeybindId || id == _medkitKeybindId ||
+                        id == _grenadeKeybindId || id == _weapon1KeybindId || id == _weapon2KeybindId ||
+                        id == MenuLeftId || id == MenuRightId || id == MenuEnterId || id == 9013;
+            if (!ours) return;
+            Logging.DebugFileLog.Write($"[049] Кнопка {id}, medicine={RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine)}");
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine)) return;
+            if (setting is not SSKeybindSetting keybind || !keybind.SyncIsPressed) return;
+
+            var player = Player.Get(hub);
+            if (player == null || !player.IsAlive) return;
+            if (player.Role.Type != RoleTypeId.Scp049) return;
+
+            if (id == _pickupKeybindId)  { TryStartPickup(player); return; }
+            if (id == MenuLeftId)        { NavigateMenu(player, -1); return; }
+            if (id == MenuRightId)       { NavigateMenu(player, 1); return; }
+            if (id == MenuEnterId || id == 9013) { MenuEnter(player); return; }
+            if (id == _keycardKeybindId) { QuickToggle(player, t => t.ToString().StartsWith("Keycard"), 0); return; }
+            if (id == _medkitKeybindId)  { QuickToggle(player, t => t == ItemType.Medkit, 0); return; }
+            if (id == _grenadeKeybindId) { QuickToggle(player, t => t == ItemType.GrenadeHE || t == ItemType.GrenadeFlash, 0); return; }
+            if (id == _weapon1KeybindId) { QuickToggle(player, IsWeaponItem, 0); return; }
+            if (id == _weapon2KeybindId) { QuickToggle(player, IsWeaponItem, 1); return; }
+        }
+
+        // ═════════════ Подбор ═════════════
+
+        private void TryStartPickup(Player player)
+        {
+            string uid = player.UserId;
+            var ps = GetPickupState(uid);
+
+            if (ps.IsPicking)
+            {
+                HudNoticeService.Show(player, "<color=red>Вы уже берёте предмет</color>", 1f);
+                return;
+            }
+
+            Pickup targetPickup = GetPickupInCrosshair(player);
+            Logging.DebugFileLog.Write($"[049] TryStartPickup: target={(targetPickup == null ? "null" : targetPickup.Type.ToString())}");
+            if (targetPickup == null)
+            {
+                HudNoticeService.Show(player, "<color=red>Нет предмета в прицеле</color>", 1f);
+                return;
+            }
+
+            var inv = GetInventory(uid);
+
+            if (!IsAmmoType(targetPickup.Type) && inv != null && inv.Count > 0)
+            {
+                if (inv.Contains(targetPickup.Type))
+                {
+                    HudNoticeService.Show(player, "<color=red>У вас уже есть такой предмет</color>", 1.5f);
+                    return;
+                }
+            }
+
+            if (IsAmmoType(targetPickup.Type))
+            {
+                if (inv.Count(t => IsAmmoType(t)) >= 5)
+                {
+                    HudNoticeService.Show(player, "<color=red>Макс. 5 пачек патронов</color>", 1f);
+                    return;
+                }
+            }
+            else if (IsWeaponItem(targetPickup.Type))
+            {
+                int maxWeapons = HasArmor(player) ? 2 : 1;
+                if (inv.Count(t => IsWeaponItem(t)) >= maxWeapons)
+                {
+                    HudNoticeService.Show(player, $"<color=red>Макс. {maxWeapons} оружия</color>", 1.5f);
+                    return;
+                }
+                if (inv.Count >= 8)
+                {
+                    HudNoticeService.Show(player, "<color=red>Макс. 8 предметов</color>", 1f);
+                    return;
+                }
+            }
+            else if (inv.Count >= 8)
+            {
+                HudNoticeService.Show(player, "<color=red>Макс. 8 предметов</color>", 1f);
+                return;
+            }
+
+            ps.IsPicking = true;
+            ps.Elapsed = 0f;
+            ps.Duration = GetPickupTime(targetPickup.Type);
+            ps.ItemName = ShortName(targetPickup.Type);
+
+            Timing.RunCoroutine(PickupCoroutine(player, ps, targetPickup));
+        }
+
+        private IEnumerator<float> PickupCoroutine(Player player, PickupState ps, Pickup target)
+        {
+            Vector3 itemPos = target.Position;
+
+            while (ps.Elapsed < ps.Duration)
+            {
+                yield return Timing.WaitForSeconds(0.25f);
+                ps.Elapsed += 0.25f;
+
+                if (player == null || !player.IsAlive || player.Role.Type != RoleTypeId.Scp049)
+                {
+                    ps.IsPicking = false;
+                    yield break;
+                }
+                if (target == null)
+                {
+                    ps.IsPicking = false;
+                    HudNoticeService.Show(player, "<color=red>Предмет пропал</color>", 1f);
+                    yield break;
+                }
+                if (Vector3.Distance(player.Position, itemPos) > 4f)
+                {
+                    ps.IsPicking = false;
+                    HudNoticeService.Show(player, "<color=red>Вы отошли — подбор прерван</color>", 1.5f);
+                    yield break;
+                }
+            }
+
+            ps.IsPicking = false;
+            if (target == null) yield break;
+
+            var inv = GetInventory(player.UserId);
+            inv.Add(target.Type);
+            try { target.Destroy(); } catch { }
+            Logging.DebugFileLog.Write($"[049] Взят {ps.ItemName}, inv={inv.Count}");
+            HudNoticeService.Show(player, $"<color=#00FF00>Предмет {ps.ItemName} взят</color>", 1f);
+        }
+
+        private Pickup GetPickupInCrosshair(Player player)
+        {
+            try
+            {
+                Transform cam = player.CameraTransform;
+                Vector3 origin  = cam != null ? cam.position : player.Position + Vector3.up * 1.5f;
+                Vector3 forward = cam != null ? cam.forward  : player.Transform.forward;
+
+                float maxDist = 5f;
+                Pickup best = null;
+                float bestDot = 0.35f;
+                Pickup nearest = null;
+                float nearestDist = 2.2f;
+
+                foreach (var pickup in Pickup.List)
+                {
+                    if (pickup == null) continue;
+                    float dist = Vector3.Distance(origin, pickup.Position);
+                    if (dist > maxDist) continue;
+
+                    Vector3 dir = (pickup.Position - origin).normalized;
+                    float dot = Vector3.Dot(forward, dir);
+                    if (dot > bestDot) { bestDot = dot; best = pickup; }
+
+                    float distToFeet = Vector3.Distance(player.Position, pickup.Position);
+                    if (distToFeet < nearestDist) { nearestDist = distToFeet; nearest = pickup; }
+                }
+                return best ?? nearest;
+            }
+            catch { return null; }
+        }
+
+        private float GetPickupTime(ItemType type)
+        {
+            if (type == ItemType.Coin) return 0.4f;
+            if (type == ItemType.Flashlight) return 0.5f;
+            if (IsAmmoType(type)) return 0.5f;
+            if (type.ToString().StartsWith("Keycard")) return 0.8f;
+            if (type == ItemType.Radio) return 1f;
+            if (type == ItemType.Medkit) return 1.5f;
+            if (type == ItemType.Adrenaline || type == ItemType.Painkillers || type == ItemType.SCP500) return 0.8f;
+            if (IsWeaponItem(type)) return 2.5f;
+            if (type == ItemType.MicroHID) return 4f;
+            return 1f;
+        }
+
+        // ═════════════ Меню и экипировка ═════════════
+
+        private void NavigateMenu(Player player, int direction)
+        {
+            var menu = GetMenu(player.UserId);
+            var inv = GetInventory(player.UserId);
+            int 

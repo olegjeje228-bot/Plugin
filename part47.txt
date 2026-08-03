@@ -1,0 +1,636 @@
+ null)
+                return;
+
+            Timing.CallDelayed(0.3f, () =>
+            {
+                try
+                {
+                    if (player == null || !player.IsConnected)
+                        return;
+
+                    Firearm firearm = item as Firearm;
+
+                    if (firearm != null)
+                        firearm.MagazineAmmo = MaxLoaded - 1;
+
+                    if (player.GetAmmo(AmmoType.Ammo12Gauge) < 6)
+                        player.AddAmmo(AmmoType.Ammo12Gauge, 6);
+
+                    SpecDebug.Log("ГРП: подготовлено оружие serial " + item.Serial + " у " + player.Nickname);
+                }
+                catch (Exception e)
+                {
+                    SpecDebug.Log("ГРП: подготовка оружия err " + e.Message);
+                }
+            });
+        }
+
+        protected override void OnReloading(ReloadingWeaponEventArgs ev)
+        {
+            SpecDebug.Log("ГРП: OnReloading от " + (ev.Player == null ? "null" : ev.Player.Nickname));
+            ev.IsAllowed = false;
+
+            if (ev.Player == null || ev.Firearm == null)
+                return;
+
+            if (reloadingNow.Contains(ev.Firearm.Serial))
+                return;
+
+            Timing.RunCoroutine(ReloadOneByOne(ev.Player, ev.Firearm.Serial));
+        }
+
+        private IEnumerator<float> ReloadOneByOne(Player player, ushort serial)
+        {
+            reloadingNow.Add(serial);
+
+            while (true)
+            {
+                if (player == null || !player.IsAlive || player.CurrentItem == null || player.CurrentItem.Serial != serial)
+                    break;
+
+                int count;
+                Loaded.TryGetValue(serial, out count);
+
+                if (count >= MaxLoaded)
+                {
+                    HudNoticeService.Show(player, "Заряжен полностью: " + count + "/" + MaxLoaded, 2f, NoticePosition.Center);
+                    break;
+                }
+
+                Item grenade = player.Items.FirstOrDefault(i => i.Type == ItemType.GrenadeHE);
+
+                if (grenade == null)
+                {
+                    HudNoticeService.Show(player, "<color=yellow>Нет гранат в инвентаре</color>", 2f, NoticePosition.Center);
+                    break;
+                }
+
+                yield return Timing.WaitForSeconds(0.9f);
+
+                if (player == null || !player.IsAlive || player.CurrentItem == null || player.CurrentItem.Serial != serial)
+                    break;
+
+                grenade = player.Items.FirstOrDefault(i => i.Type == ItemType.GrenadeHE);
+
+                if (grenade == null)
+                    break;
+
+                player.RemoveItem(grenade);
+                Loaded.TryGetValue(serial, out count);
+                count++;
+                Loaded[serial] = count;
+                HudNoticeService.Show(player, "Заряжено: " + count + "/" + MaxLoaded, 1.5f, NoticePosition.Center);
+                SpecDebug.Log("ГРП: заряжено " + count + "/" + MaxLoaded + " у " + player.Nickname);
+            }
+
+            reloadingNow.Remove(serial);
+        }
+
+        protected override void OnShooting(ShootingEventArgs ev)
+        {
+            ev.IsAllowed = false;
+
+            Player player = ev.Player;
+
+            if (player == null || ev.Firearm == null)
+                return;
+
+            ushort serial = ev.Firearm.Serial;
+            int count;
+            Loaded.TryGetValue(serial, out count);
+
+            if (count <= 0)
+            {
+                HudNoticeService.Show(player, "<color=yellow>Пусто! Перезарядка: R (нужны гранаты)</color>", 2f, NoticePosition.Center);
+                return;
+            }
+
+            bool ads = adsSerials.Contains(serial);
+            Vector3 direction = player.CameraTransform.forward;
+
+            SpecAudio.PlayAt(player.Position, "granatomet.ogg", 2f, 20f);
+
+            if (ads && count >= 2)
+            {
+                Loaded[serial] = count - 2;
+                FireOne(player, Quaternion.AngleAxis(-1.5f, player.CameraTransform.up) * direction, AdsSpeed, true);
+                FireOne(player, Quaternion.AngleAxis(1.5f, player.CameraTransform.up) * direction, AdsSpeed, true);
+                Recoil(player, 10f);
+            }
+            else
+            {
+                Loaded[serial] = count - 1;
+                float speed = ads ? AdsSpeed : NormalSpeed;
+                FireOne(player, direction, speed, ads);
+                Recoil(player, ads ? 10f : 5f);
+            }
+
+            SpecDebug.Log("ГРП: выстрел, ads=" + ads + ", осталось " + Loaded[serial]);
+        }
+
+        private static void FireOne(Player player, Vector3 direction, float speed, bool ads)
+        {
+            try
+            {
+                Projectile projectile = player.ThrowGrenade(ProjectileType.FragGrenade, false).Projectile;
+
+                TimeGrenadeProjectile timed = projectile as TimeGrenadeProjectile;
+
+                if (timed != null)
+                    timed.FuseTime = FuseSeconds;
+
+                projectile.Position = player.CameraTransform.position + direction * 0.7f;
+
+                Rigidbody body = projectile.GameObject.GetComponent<Rigidbody>();
+
+                if (body != null)
+                {
+                    body.velocity = direction * speed;
+                    body.angularVelocity = Vector3.zero;
+                }
+
+                projectile.GameObject.AddComponent<NoPhysicsProjectile>();
+                projectile.GameObject.AddComponent<SpecGrenadeTag>();
+
+                DoorDetonator detonator = projectile.GameObject.AddComponent<DoorDetonator>();
+                detonator.Init(projectile, player, ads);
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("ГРП выстрел err: " + e.Message);
+            }
+        }
+
+        private static void Recoil(Player player, float degreesUp)
+        {
+            try
+            {
+                Vector3 angles = player.CameraTransform.rotation.eulerAngles;
+                player.Rotation = Quaternion.Euler(angles.x - degreesUp, angles.y, angles.z);
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("ГРП recoil err: " + e.Message);
+            }
+        }
+    }
+
+    public sealed class DoorDetonator : MonoBehaviour
+    {
+        private Exiled.API.Features.Pickups.Projectiles.Projectile projectile;
+
+        private Exiled.API.Features.Player attacker;
+
+        private bool ads;
+
+        private bool done;
+
+        public void Init(Exiled.API.Features.Pickups.Projectiles.Projectile proj, Exiled.API.Features.Player shooter, bool aimed)
+        {
+            projectile = proj;
+            attacker = shooter;
+            ads = aimed;
+        }
+
+        private void OnCollisionEnter(Collision collision)
+        {
+            if (collision != null && collision.collider != null)
+                TryDoor(collision.collider);
+        }
+
+        private void OnTriggerEnter(Collider other)
+        {
+            TryDoor(other);
+        }
+
+        private void TryDoor(Collider collider)
+        {
+            if (done || collider == null)
+                return;
+
+            Interactables.Interobjects.DoorUtils.DoorVariant doorVariant =
+                collider.GetComponentInParent<Interactables.Interobjects.DoorUtils.DoorVariant>();
+
+            if (doorVariant == null)
+                return;
+
+            done = true;
+            Vector3 position = transform.position;
+            SpecDebug.Log("ГРП: контакт с дверью, мгновенная детонация");
+
+            try
+            {
+                Door door = Door.Get(doorVariant);
+                BreakableDoor breakable = door as BreakableDoor;
+
+                if (breakable != null && !breakable.IsDestroyed)
+                    breakable.Break();
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("ГРП: поломка двери err " + e.Message);
+            }
+
+            foreach (Player target in Player.List)
+            {
+                if (target == null || !target.IsAlive)
+                    continue;
+
+                float distance = Vector3.Distance(target.Position, position);
+
+                if (distance > 10f)
+                    continue;
+
+                float damage = distance <= 5f ? 30f : Mathf.Lerp(30f, 2f, (distance - 5f) / 5f);
+
+                try
+                {
+                    target.Hurt(attacker, damage, DamageType.Explosion);
+                    SpecDebug.Log("ГРП: урон " + damage.ToString("0") + " -> " + target.Nickname + " (" + distance.ToString("0.0") + " м)");
+                }
+                catch (Exception e)
+                {
+                    SpecDebug.Log("ГРП: урон err " + e.Message);
+                }
+            }
+
+            try
+            {
+                Map.ExplodeEffect(position, ProjectileType.FragGrenade);
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("ГРП: эффект err " + e.Message);
+            }
+
+            if (ads)
+                SpecAudio.PlayAt(position, "granatomet1.ogg", 5f, 20f);
+
+            try
+            {
+                if (projectile != null)
+                    projectile.Destroy();
+                else
+                    Destroy(gameObject);
+            }
+            catch
+            {
+                Destroy(gameObject);
+            }
+        }
+
+        private void OnDestroy()
+        {
+            if (done)
+                return;
+
+            done = true;
+
+            if (ads)
+                SpecAudio.PlayAt(transform.position, "granatomet1.ogg", 5f, 20f);
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\InventoryLock.cs =====
+namespace EventHUD.SpecItems
+{
+    using System.Collections.Generic;
+    using EventHUD.Hud;
+    using Exiled.API.Features;
+    using Exiled.Events.EventArgs.Player;
+
+    public static class InventoryLock
+    {
+        private static readonly Dictionary<string, ushort> Locked = new Dictionary<string, ushort>();
+
+        public static bool IsLocked(Player player)
+        {
+            if (player == null)
+                return false;
+
+            return Locked.ContainsKey(player.UserId ?? player.Nickname);
+        }
+
+        public static void Lock(Player player, ushort allowedSerial)
+        {
+            if (player == null)
+                return;
+
+            string id = player.UserId ?? player.Nickname;
+            Locked[id] = allowedSerial;
+
+            if (player.CurrentItem != null && player.CurrentItem.Serial != allowedSerial)
+                player.CurrentItem = null;
+
+            HudNoticeService.Show(player, "<color=red>Инвентарь заблокирован</color>", 4f, NoticePosition.Center);
+            SpecDebug.Log("ЛОК: " + player.Nickname + " заблокирован, разрешён serial " + allowedSerial);
+        }
+
+        public static void Unlock(Player player)
+        {
+            if (player == null)
+                return;
+
+            string id = player.UserId ?? player.Nickname;
+
+            if (Locked.Remove(id))
+            {
+                HudNoticeService.Show(player, "<color=green>Инвентарь разблокирован</color>", 2f, NoticePosition.Center);
+                SpecDebug.Log("ЛОК: " + player.Nickname + " разблокирован");
+            }
+        }
+
+        public static void Enable()
+        {
+            Exiled.Events.Handlers.Player.ChangingItem += OnChangingItem;
+            Exiled.Events.Handlers.Player.DroppingItem += OnDroppingItem;
+            Exiled.Events.Handlers.Player.DroppingAmmo += OnDroppingAmmo;
+            Exiled.Events.Handlers.Player.PickingUpItem += OnPickingUpItem;
+            Exiled.Events.Handlers.Player.ReloadingWeapon += OnReloadingWeapon;
+            Exiled.Events.Handlers.Player.Shooting += OnShooting;
+            Exiled.Events.Handlers.Player.Left += OnLeft;
+            Exiled.Events.Handlers.Player.Died += OnDied;
+            Exiled.Events.Handlers.Server.RoundStarted += OnRoundStarted;
+            SpecDebug.Log("ЛОК: система включена");
+        }
+
+        public static void Disable()
+        {
+            Exiled.Events.Handlers.Player.ChangingItem -= OnChangingItem;
+            Exiled.Events.Handlers.Player.DroppingItem -= OnDroppingItem;
+            Exiled.Events.Handlers.Player.DroppingAmmo -= OnDroppingAmmo;
+            Exiled.Events.Handlers.Player.PickingUpItem -= OnPickingUpItem;
+            Exiled.Events.Handlers.Player.ReloadingWeapon -= OnReloadingWeapon;
+            Exiled.Events.Handlers.Player.Shooting -= OnShooting;
+            Exiled.Events.Handlers.Player.Left -= OnLeft;
+            Exiled.Events.Handlers.Player.Died -= OnDied;
+            Exiled.Events.Handlers.Server.RoundStarted -= OnRoundStarted;
+            Locked.Clear();
+        }
+
+        private static bool TryGetAllowed(Player player, out ushort allowedSerial)
+        {
+            allowedSerial = 0;
+
+            if (player == null)
+                return false;
+
+            return Locked.TryGetValue(player.UserId ?? player.Nickname, out allowedSerial);
+        }
+
+        private static void OnChangingItem(ChangingItemEventArgs ev)
+        {
+            ushort allowed;
+
+            if (!TryGetAllowed(ev.Player, out allowed))
+                return;
+
+            if (ev.Item != null && ev.Item.Serial == allowed)
+                return;
+
+            ev.IsAllowed = false;
+        }
+
+        private static void OnDroppingItem(DroppingItemEventArgs ev)
+        {
+            if (IsLocked(ev.Player))
+                ev.IsAllowed = false;
+        }
+
+        private static void OnDroppingAmmo(DroppingAmmoEventArgs ev)
+        {
+            if (IsLocked(ev.Player))
+                ev.IsAllowed = false;
+        }
+
+        private static void OnPickingUpItem(PickingUpItemEventArgs ev)
+        {
+            if (IsLocked(ev.Player))
+                ev.IsAllowed = false;
+        }
+
+        private static void OnReloadingWeapon(ReloadingWeaponEventArgs ev)
+        {
+            if (IsLocked(ev.Player))
+                ev.IsAllowed = false;
+        }
+
+        private static void OnShooting(ShootingEventArgs ev)
+        {
+            ushort allowed;
+
+            if (!TryGetAllowed(ev.Player, out allowed))
+                return;
+
+            if (ev.Firearm != null && ev.Firearm.Serial == allowed)
+                return;
+
+            ev.IsAllowed = false;
+        }
+
+        private static void OnLeft(LeftEventArgs ev)
+        {
+            if (ev.Player != null)
+                Locked.Remove(ev.Player.UserId ?? ev.Player.Nickname);
+        }
+
+        private static void OnDied(DiedEventArgs ev)
+        {
+            if (ev.Player != null && Locked.Remove(ev.Player.UserId ?? ev.Player.Nickname))
+                SpecDebug.Log("ЛОК: " + ev.Player.Nickname + " разблокирован (смерть)");
+        }
+
+        private static void OnRoundStarted()
+        {
+            if (Locked.Count > 0)
+                SpecDebug.Log("ЛОК: рестарт раунда, снято блокировок: " + Locked.Count);
+
+            Locked.Clear();
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\NoPhysicsProjectile.cs =====
+namespace EventHUD.SpecItems
+{
+    using System;
+    using UnityEngine;
+
+    public sealed class NoPhysicsProjectile : MonoBehaviour
+    {
+        private static readonly string[] IgnoredLayers = new string[]
+        {
+            "Pickup", "Pickups", "Item", "Items", "Ragdoll", "Ragdolls", "Hitbox", "Grenade",
+        };
+
+        private Rigidbody body;
+
+        private void Awake()
+        {
+            body = GetComponent<Rigidbody>();
+            int mask = 0;
+
+            foreach (string name in IgnoredLayers)
+            {
+                int layer = LayerMask.NameToLayer(name);
+
+                if (layer >= 0)
+                    mask |= 1 << layer;
+            }
+
+            if (mask != 0)
+                FallbackIgnore(mask);
+        }
+
+        private void FallbackIgnore(int mask)
+        {
+            try
+            {
+                Collider mine = GetComponent<Collider>();
+
+                if (mine is null)
+                    return;
+
+                Collider[] around = Physics.OverlapSphere(transform.position, 6f, mask);
+
+                foreach (Collider other in around)
+                {
+                    if (!(other is null) && other != mine)
+                        Physics.IgnoreCollision(mine, other, true);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\SpecAudio.cs =====
+namespace EventHUD.SpecItems
+{
+    using System;
+    using System.Collections.Generic;
+    using System.IO;
+    using System.Linq;
+    using System.Reflection;
+    using Exiled.API.Features;
+    using UnityEngine;
+
+    public static class SpecAudio
+    {
+        private static readonly HashSet<string> LoadedClips = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private static System.Type audioPlayerType;
+
+        private static System.Type speakerType;
+
+        private static bool typesChecked;
+
+        public static string AudioDir
+        {
+            get
+            {
+                return Path.Combine(Path.Combine(Paths.Configs, "EventHUD"), "Audio");
+            }
+        }
+
+        public static void PlayAt(Vector3 position, string fileName, float volume, float range)
+        {
+            try
+            {
+                InitTypes();
+
+                if (audioPlayerType == null)
+                {
+                    SpecDebug.Log("AUDIO: сборка AudioPlayer не найдена");
+                    return;
+                }
+
+                string alias = EnsureClip(fileName);
+
+                if (alias == null)
+                    return;
+
+                float apiVolume = Mathf.Clamp01(volume / 5f);
+                float distance = Mathf.Max(1f, range);
+                string playerName = "SpecItem_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+
+                MethodInfo createOrGet = audioPlayerType.GetMethods()
+                    .FirstOrDefault(m => m.Name == "CreateOrGet");
+
+                if (createOrGet == null)
+                {
+                    SpecDebug.Log("AUDIO: CreateOrGet не найден");
+                    return;
+                }
+
+                ParameterInfo[] pars = createOrGet.GetParameters();
+                object[] args = new object[pars.Length];
+                args[0] = playerName;
+
+                for (int i = 1; i < pars.Length; i++)
+                {
+                    System.Type parameterType = pars[i].ParameterType;
+
+                    if (parameterType == typeof(bool))
+                        args[i] = false;
+                    else if (parameterType == typeof(byte))
+                        args[i] = (byte)255;
+                    else
+                        args[i] = null;
+                }
+
+                object player = createOrGet.Invoke(null, args);
+
+                if (player == null)
+                {
+                    SpecDebug.Log("AUDIO: CreateOrGet вернул null");
+                    return;
+                }
+
+                System.Type t = player.GetType();
+
+                SetProperty(t, player, "SendSoundGlobally", false);
+                SetProperty(t, player, "DestroyWhenAllClipsPlayed", true);
+
+                MethodInfo addSpeaker = t.GetMethod(
+                    "AddSpeaker",
+                    new System.Type[] { typeof(string), typeof(bool), typeof(float), typeof(float) });
+
+                if (addSpeaker != null)
+                {
+                    object speaker = addSpeaker.Invoke(player, new object[] { "Main", true, 1f, distance });
+
+                    if (speaker != null && speakerType != null)
+                    {
+                        PropertyInfo positionProperty = speakerType.GetProperty("Position");
+
+                        if (positionProperty != null && positionProperty.CanWrite)
+                        {
+                            positionProperty.SetValue(speaker, position, null);
+                        }
+                        else
+                        {
+                            MethodInfo setPosition = speakerType.GetMethod("SetPosition", new System.Type[] { typeof(Vector3) });
+
+                            if (setPosition != null)
+                                setPosition.Invoke(speaker, new object[] { position });
+                        }
+                    }
+                }
+
+                MethodInfo setSpeakerPosition = t.GetMethod(
+                    "SetSpeakerPosition",
+                    new System.Type[] { typeof(string), typeof(Vector3) });
+
+                if (setSpeakerPosition != null)
+                    setSpeakerPosition.Invoke(player, new object[] { "Main", position });
+
+                MethodInfo addClip = t.GetMethod(
+                    "AddClip",
+                    new System.Type[] { typeof(string), typeof(float), typeof(bool), typeof(bool) });
+
+                if (addClip == null)
+         

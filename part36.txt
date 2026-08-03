@@ -1,0 +1,529 @@
+�пресс", Duration = 4f },
+                        new HealStage { Name = "Заморозка", Duration = 10f },
+                        new HealStage { Name = "Держать", Duration = 60f });
+
+                case LocalInjuryType.Gunshot:
+                    return MakeItem($"Огнестрел ({partName})", "Извлечение + перевязка", 10f,
+                        hasSupplies, noReason, null, inj.Type, inj.Part, timeMult,
+                        new HealStage { Name = "Извлечение + перевязка", Duration = 10f });
+
+                case LocalInjuryType.Stab:
+                    return MakeItem($"Ножевая ({partName})", "Обработка + перевязка", 6f,
+                        hasSupplies, noReason, null, inj.Type, inj.Part, timeMult,
+                        new HealStage { Name = "Обработка + перевязка", Duration = 6f });
+
+                case LocalInjuryType.Chemical:
+                    return MakeItem($"Химическая ({partName})", "Нейтрализация", 25f,
+                        hasSupplies, noReason, null, inj.Type, inj.Part, timeMult,
+                        new HealStage { Name = "Нейтрализация", Duration = 25f });
+
+                case LocalInjuryType.Burn:
+                    return MakeItem($"Ожог ({partName})", "Обработка ожога", 0f,
+                        hasSupplies, noReason, null, inj.Type, inj.Part, timeMult,
+                        new HealStage { Name = "Снять урон", Duration = 2f },
+                        new HealStage { Name = "Обработка", Duration = 20f });
+
+                case LocalInjuryType.Fracture:
+                    return MakeItem($"Перелом ({partName})", "Наложить шину", 10f,
+                        hasSupplies, noReason, null, inj.Type, inj.Part, timeMult,
+                        new HealStage { Name = "Наложить шину", Duration = 10f });
+
+                case LocalInjuryType.Corrosion:
+                    return new MedkitMenuItem
+                    {
+                        DisplayName = "Коррозия",
+                        CanHeal = false,
+                        CannotHealReason = "Невозможно вылечить",
+                        LocalTarget = inj.Type,
+                        BodyPartTarget = inj.Part
+                    };
+
+                default:
+                    return null;
+            }
+        }
+
+        private static MedkitMenuItem MakeItem(
+            string name, string procedure, float fallbackTime,
+            bool canHeal, string noReason,
+            GlobalCondition? global, LocalInjuryType? local, BodyPart? part,
+            float timeMult,
+            params HealStage[] stages)
+        {
+            // Масштабируем стадии по RP
+            var scaledStages = new List<HealStage>();
+            float total = 0f;
+            foreach (var s in stages)
+            {
+                float d = s.Duration * timeMult;
+                scaledStages.Add(new HealStage { Name = s.Name, Duration = d });
+                total += d;
+            }
+            if (total <= 0.01f) total = fallbackTime * timeMult;
+
+            // Генерируем TimeLabel
+            string timeLabel = "";
+            if (canHeal && total > 0)
+            {
+                if (scaledStages.Count <= 1)
+                    timeLabel = $"[{total:0.#}с]";
+                else
+                    timeLabel = "[" + string.Join("+", scaledStages.Select(x => $"{x.Duration:0.#}с")) + "]";
+            }
+
+            return new MedkitMenuItem
+            {
+                DisplayName      = name,
+                Procedure        = canHeal ? procedure : "",
+                TotalTime        = canHeal ? total : 0,
+                TimeLabel        = timeLabel,
+                CanHeal          = canHeal,
+                CannotHealReason = canHeal ? null : noReason,
+                GlobalTarget     = global,
+                LocalTarget      = local,
+                BodyPartTarget   = part,
+                Stages           = canHeal ? scaledStages : new List<HealStage>(),
+                IsFirstAid       = false
+            };
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedkitSSSHandler.cs =====
+using System;
+using System.Linq;
+using EventHUD.Rpm;
+using Exiled.API.Features;
+using UserSettings.ServerSpecific;
+
+namespace EventHUD.Medicine
+{
+    public static class MedkitSSSHandler
+    {
+        private static bool _registered;
+        private static int _leftId  = 9010;
+        private static int _rightId = 9011;
+        private static int _enterId = 9012;
+
+        public static void Register()
+        {
+            if (_registered) return;
+            _registered = true;
+
+            var left  = new SSKeybindSetting(_leftId,  "← Назад",           UnityEngine.KeyCode.LeftArrow);
+            var right = new SSKeybindSetting(_rightId, "→ Далее",           UnityEngine.KeyCode.RightArrow);
+            var enter = new SSKeybindSetting(_enterId, "Подтвердить", UnityEngine.KeyCode.Return);
+
+            EventHUD.Hud.SssRoleSync.HumanSettings.Add(left);
+            EventHUD.Hud.SssRoleSync.HumanSettings.Add(right);
+            EventHUD.Hud.SssRoleSync.HumanSettings.Add(enter);
+            EventHUD.Hud.SssRoleSync.Scp049Settings.Add(left);
+            EventHUD.Hud.SssRoleSync.Scp049Settings.Add(right);
+            // 049: бинд подтверждения на E (9013) — добавлен в Scp049Handler.RegisterSss()
+            var enter049 = new SSKeybindSetting(9013, "Подтвердить (049)", UnityEngine.KeyCode.E);
+            EventHUD.Hud.SssRoleSync.Scp049Settings.Add(enter049);
+            EventHUD.Hud.SssRoleSync.Scp049Settings.Add(enter);
+
+            ServerSpecificSettingsSync.ServerOnSettingValueReceived += OnSettingChanged;
+        }
+
+        public static void Unregister()
+        {
+            if (!_registered) return;
+            _registered = false;
+            ServerSpecificSettingsSync.ServerOnSettingValueReceived -= OnSettingChanged;
+        }
+
+        private static bool IsSelectable(MedkitMenuItem it) => it.CanHeal || it.IsInventoryView;
+
+        private static void EnsureValidSelection(MedkitMenuState menuState, System.Collections.Generic.List<MedkitMenuItem> items)
+        {
+            if (items.Count == 0) return;
+            if (menuState.SelectedIndex < 0 || menuState.SelectedIndex >= items.Count || !IsSelectable(items[menuState.SelectedIndex]))
+            {
+                for (int i = 0; i < items.Count; i++)
+                {
+                    if (IsSelectable(items[i])) { menuState.SelectedIndex = i; return; }
+                }
+                menuState.SelectedIndex = 0;
+            }
+        }
+
+        private static void Navigate(MedkitMenuState menuState, System.Collections.Generic.List<MedkitMenuItem> items, int direction)
+        {
+            if (items.Count == 0) return;
+            for (int attempt = 0; attempt < items.Count; attempt++)
+            {
+                menuState.SelectedIndex += direction;
+                if (menuState.SelectedIndex < 0) menuState.SelectedIndex = items.Count - 1;
+                if (menuState.SelectedIndex >= items.Count) menuState.SelectedIndex = 0;
+                if (IsSelectable(items[menuState.SelectedIndex])) break;
+            }
+        }
+
+        private static void OnSettingChanged(ReferenceHub hub, ServerSpecificSettingBase setting)
+        {
+            if (setting.SettingId != _leftId && setting.SettingId != _rightId && setting.SettingId != _enterId && setting.SettingId != 9013)
+                return;
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                return;
+            if (!Rpm.FullRpState.IsEnabled)
+                return;
+            if (setting is not SSKeybindSetting keybind || !keybind.SyncIsPressed)
+                return;
+            var player = Player.Get(hub);
+            if (player == null || !player.IsAlive) return;
+            if (player.Role.Team == PlayerRoles.Team.SCPs) return; // у SCP-049 своё меню
+
+            // Самолечение — аптечка должна быть в руках
+            if (player.CurrentItem == null || player.CurrentItem.Type != ItemType.Medkit)
+                return;
+
+            var kit = MedkitInventoryStorage.GetOrCreate(player.CurrentItem.Serial);
+            if (kit == null) return;
+
+            var medState = MedicalStorage.GetOrCreate(player.UserId);
+            var menuState = MedkitStorage.GetOrCreate(player.UserId);
+            var items = MedkitMenuBuilder.Build(medState, Plugin.Instance.Config, kit, false);
+
+            if (setting.SettingId == _enterId || setting.SettingId == 9013)
+            {
+                if (menuState.IsHealing) return;
+
+                EnsureValidSelection(menuState, items);
+
+                if (menuState.ShowInventory)
+                {
+                    menuState.ShowInventory = false;
+                    menuState.SelectedIndex = 0;
+                    return;
+                }
+
+                if (menuState.SelectedIndex < 0 || menuState.SelectedIndex >= items.Count) return;
+                var selected = items[menuState.SelectedIndex];
+
+                if (selected.IsInventoryView)
+                {
+                    menuState.ShowInventory = true;
+                    return;
+                }
+
+                // Запуск лечения
+                Plugin.Instance.MedkitHeals?.StartHealing(player);
+                return;
+            }
+
+            // Навигация Left/Right — только если не лечим
+            if (menuState.IsHealing) return;
+
+            EnsureValidSelection(menuState, items);
+
+            int direction = 0;
+            if (setting.SettingId == _leftId) direction = -1;
+            else if (setting.SettingId == _rightId) direction = 1;
+
+            if (direction != 0)
+            {
+                Navigate(menuState, items, direction);
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedkitStorage.cs =====
+using System.Collections.Generic;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Хранилище состояний меню аптечки для каждого игрока.
+    /// </summary>
+    public static class MedkitStorage
+    {
+        private static readonly Dictionary<string, MedkitMenuState> _states = new();
+
+        public static MedkitMenuState GetOrCreate(string userId)
+        {
+            if (!_states.TryGetValue(userId, out var state))
+            {
+                state = new MedkitMenuState();
+                _states[userId] = state;
+            }
+            return state;
+        }
+
+        public static bool TryGet(string userId, out MedkitMenuState state) =>
+            _states.TryGetValue(userId, out state);
+
+        public static void Remove(string userId)
+        {
+            if (string.IsNullOrEmpty(userId))
+                return;
+            _states.Remove(userId);
+        }
+
+        public static void ClearAll() => _states.Clear();
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedkitType.cs =====
+namespace EventHUD.Medicine
+{
+    public enum MedkitType
+    {
+        Civilian,   // Гражданская (~0.5 кг)
+        Industrial, // Рабочая / Охранная (~1.5 кг)
+        Military,   // Военная IFAK (~1 кг)
+        Paramedic   // Парамедика (~5-8 кг)
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedkitTypeAssigner.cs =====
+using Exiled.API.Enums;
+using Exiled.API.Features;
+using PlayerRoles;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Определяет тип аптечки при подборе/спавне.
+    /// 
+    /// Правила:
+    ///   МОГ, Мародёр ПХ, Репрессор ПХ → Военная (IFAK)
+    ///   NtfSpecialist (парамедик)     → Парамедика
+    ///   СБ (FacilityGuard)            → Рабочая
+    ///   НС (Scientist)               → Гражданская
+    ///   Остальные FoundationForces    → Рабочая (младшие МОГ)
+    ///   Остальные ChaosInsurgency     → Рабочая (младшие ПХ)
+    ///   
+    ///   По карте (если рация не назначена / нет владельца):
+    ///     Light Containment → Гражданская
+    ///     Heavy Containment → Рабочая
+    ///     Entrance Zone     → Гражданская
+    ///     Surface           → Рабочая
+    /// </summary>
+    public static class MedkitTypeAssigner
+    {
+        /// <summary>
+        /// Определяет тип аптечки по роли игрока который подобрал.
+        /// </summary>
+        public static MedkitType GetByRole(Player player)
+        {
+            if (player == null)
+                return MedkitType.Civilian;
+
+            var role = player.Role.Type;
+
+            // Парамедик = NtfSpecialist
+            if (role == RoleTypeId.NtfSpecialist)
+                return MedkitType.Paramedic;
+
+            // МОГ (кроме Specialist) — военная
+            if (role == RoleTypeId.NtfCaptain ||
+                role == RoleTypeId.NtfSergeant ||
+                role == RoleTypeId.NtfPrivate)
+                return MedkitType.Military;
+
+            // ПХ боевые роли — военная
+            if (role == RoleTypeId.ChaosMarauder ||
+                role == RoleTypeId.ChaosRepressor)
+                return MedkitType.Military;
+
+            // ПХ остальные — рабочая
+            if (player.Role.Team == Team.ChaosInsurgency)
+                return MedkitType.Industrial;
+
+            // СБ — рабочая
+            if (role == RoleTypeId.FacilityGuard)
+                return MedkitType.Industrial;
+
+            // НС — гражданская
+            if (role == RoleTypeId.Scientist)
+                return MedkitType.Civilian;
+
+            // Остальные FoundationForces (если есть) — рабочая
+            if (player.Role.Team == Team.FoundationForces)
+                return MedkitType.Industrial;
+
+            // Д-класс и всё остальное — гражданская
+            return MedkitType.Civilian;
+        }
+
+        /// <summary>
+        /// Определяет тип аптечки по зоне на карте (для валяющихся аптечек).
+        /// </summary>
+        public static MedkitType GetByZone(ZoneType zone)
+        {
+            return zone switch
+            {
+                ZoneType.LightContainment => MedkitType.Civilian,
+                ZoneType.HeavyContainment => MedkitType.Industrial,
+                ZoneType.Entrance         => MedkitType.Civilian,
+                ZoneType.Surface          => MedkitType.Industrial,
+                _                         => MedkitType.Civilian
+            };
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedkitTypeExtensions.cs =====
+namespace EventHUD.Medicine
+{
+    public static class MedkitTypeExtensions
+    {
+        public static string GetDisplayName(this MedkitType t) => t switch
+        {
+            MedkitType.Civilian   => "Гражданская",
+            MedkitType.Industrial => "Рабочая",
+            MedkitType.Military   => "Военная (IFAK)",
+            MedkitType.Paramedic  => "Парамедика",
+            _                     => "?"
+        };
+
+        public static string GetColor(this MedkitType t) => t switch
+        {
+            MedkitType.Civilian   => "#88CC88",
+            MedkitType.Industrial => "#CCAA44",
+            MedkitType.Military   => "#CC4444",
+            MedkitType.Paramedic  => "#4488FF",
+            _                     => "#FFFFFF"
+        };
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\PlayerMedicalState.cs =====
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Полное медицинское состояние одного игрока.
+    /// </summary>
+    public class PlayerMedicalState
+    {
+        // ── Глобальные состояния ──
+        public HashSet<GlobalCondition> Conditions { get; } = new HashSet<GlobalCondition>();
+
+        // ── Локальные травмы (части тела) ──
+        public List<LocalInjury> Injuries { get; } = new List<LocalInjury>();
+
+        // ── Счётчики медикаментов за текущую жизнь ──
+        public int AdrenalineUsed  { get; set; }
+        public int PainkillerUsed  { get; set; }
+
+        // ── Таймеры кровотечений ──
+        /// <summary>Время начала текущего кровотечения (для фазы бурного урона).</summary>
+        public DateTime BleedingStartedAt { get; set; }
+        /// <summary>true = бурная фаза кровотечения закончилась, идёт постоянный слабый урон.</summary>
+        public bool BleedingBurstFinished { get; set; }
+
+        // ── Таймер коррозии SCP-106 ──
+        /// <summary>Время, когда 106 начал стоять рядом. null = не рядом.</summary>
+        public DateTime? CorrosionProximityStart { get; set; }
+
+        // ── Таймер SCP-244 ──
+        public DateTime? Scp244ProximityStart { get; set; }
+
+        // ── Первая помощь (временная повязка) ──
+        public bool FirstAidUsed { get; set; }
+        public DateTime FirstAidExpiresAt { get; set; }
+        public GlobalCondition? FirstAidOriginalBleeding { get; set; }
+
+        /// <summary>
+        /// Есть ли хоть одно активное состояние (кроме Normal).
+        /// </summary>
+        public bool HasAnyCondition =>
+            Conditions.Count > 0 && !(Conditions.Count == 1 && Conditions.Contains(GlobalCondition.Normal));
+
+        /// <summary>
+        /// Есть ли хоть одна травма.
+        /// </summary>
+        public bool HasAnyInjury => Injuries.Count > 0;
+
+        /// <summary>
+        /// Есть ли что-то для отображения в HUD.
+        /// </summary>
+        public bool HasAnything => HasAnyCondition || HasAnyInjury;
+
+        // ── Методы ──
+
+        public void AddCondition(GlobalCondition condition)
+        {
+            // Normal убирается при добавлении любого другого состояния
+            if (condition != GlobalCondition.Normal)
+                Conditions.Remove(GlobalCondition.Normal);
+
+            Conditions.Add(condition);
+        }
+
+        public void RemoveCondition(GlobalCondition condition)
+        {
+            Conditions.Remove(condition);
+
+            if (Conditions.Count == 0)
+                Conditions.Add(GlobalCondition.Normal);
+
+            // Если убрали кровотечение — сбрасываем первую помощь
+            if (condition == GlobalCondition.BleedingLight ||
+                condition == GlobalCondition.BleedingMedium ||
+                condition == GlobalCondition.BleedingHeavy)
+            {
+                if (GetBleedingLevel() == null)
+                {
+                    FirstAidUsed = false;
+                    FirstAidExpiresAt = default;
+                    FirstAidOriginalBleeding = null;
+                }
+            }
+        }
+
+        public bool HasCondition(GlobalCondition condition) =>
+            Conditions.Contains(condition);
+
+        public void AddInjury(LocalInjuryType type, BodyPart part)
+        {
+            // Не дублируем одинаковую травму на одной части тела
+            if (Injuries.Any(i => i.Type == type && i.Part == part))
+                return;
+
+            Injuries.Add(new LocalInjury(type, part));
+        }
+
+        public void RemoveInjury(LocalInjuryType type, BodyPart part)
+        {
+            Injuries.RemoveAll(i => i.Type == type && i.Part == part);
+        }
+
+        public bool HasInjury(LocalInjuryType type, BodyPart part) =>
+            Injuries.Any(i => i.Type == type && i.Part == part);
+
+        public bool HasInjuryType(LocalInjuryType type) =>
+            Injuries.Any(i => i.Type == type);
+
+        /// <summary>
+        /// Полный сброс — смерть / новый раунд.
+        /// </summary>
+        public void Reset()
+        {
+            Conditions.Clear();
+            Conditions.Add(GlobalCondition.Normal);
+            Injuries.Clear();
+            AdrenalineUsed  = 0;
+            PainkillerUsed  = 0;
+            BleedingStartedAt   = default;
+            BleedingBurstFinished = false;
+            CorrosionProximityStart = null;
+            Scp244ProximityStart   = null;
+            FirstAidUsed = false;
+            FirstAidExpiresAt = default;
+            FirstAidOriginalBleeding = null;
+        }
+
+        /// <summary>
+        /// Получить текущий уровень кров�

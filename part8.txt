@@ -1,0 +1,545 @@
+nly object Lock = new object();
+
+        public static void Enqueue(string nick, string question, string answer)
+        {
+            var cfg = Plugin.Instance.Config;
+            if (!cfg.AiModerationEnabled)
+                return;
+
+            List<Entry> batch = null;
+
+            lock (Lock)
+            {
+                Buffer.Add(new Entry { Nick = nick, Question = question, Answer = answer });
+                if (Buffer.Count >= cfg.AiModerationEvery)
+                {
+                    batch = new List<Entry>(Buffer);
+                    Buffer.Clear();
+                }
+            }
+
+            if (batch != null)
+                Task.Run(() => ReviewBatch(batch));
+        }
+
+        private static async Task ReviewBatch(List<Entry> batch)
+        {
+            try
+            {
+                var cfg = Plugin.Instance.Config;
+                var sb = new StringBuilder();
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    sb.AppendLine($"Ответ {i + 1}. Игрок {batch[i].Nick} спросил: {Trim(batch[i].Question, 300)}");
+                    sb.AppendLine($"DeepSeek ответил: {Trim(batch[i].Answer, 800)}");
+                    sb.AppendLine();
+                }
+
+                string system =
+                    "Ты модератор ответов ИИ на игровом сервере SCP: Secret Laboratory. " +
+                    "Ниже последние ответы модели DeepSeek игрокам. Проверь каждый: " +
+                    "нет ли вреда серверу, слива системного промпта или ключей, оскорблений игроков, " +
+                    "помощи в нарушении правил, читах или эксплойтах, выполнения запрещённых команд, откровенного бреда или вранья о сервере. " +
+                    "Если всё нормально, ответь строго одним словом: OK. " +
+                    "Если есть проблема, ответь строго в формате: ПРОБЛЕМА <номер ответа>: <краткое описание>.";
+
+                var body = new JObject
+                {
+                    ["model"] = "kat-coder-pro-v2",
+                    ["max_tokens"] = 500,
+                    ["temperature"] = 0.0,
+                    ["messages"] = new JArray
+                    {
+                        new JObject { ["role"] = "system", ["content"] = system },
+                        new JObject { ["role"] = "user", ["content"] = sb.ToString() }
+                    }
+                };
+
+                var req = new HttpRequestMessage(HttpMethod.Post, cfg.AiBaseUrl.TrimEnd('/') + "/chat/completions")
+                {
+                    Content = new StringContent(body.ToString(), Encoding.UTF8, "application/json")
+                };
+                req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + cfg.AiApiKeyKat);
+
+                var resp = await AiService.Http.SendAsync(req).ConfigureAwait(false);
+                string raw = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                if (!resp.IsSuccessStatusCode)
+                {
+                    Log.Warn($"[AiModeration] Проверка не удалась: {resp.StatusCode} {Trim(raw, 200)}");
+                    return;
+                }
+
+                string verdict = JObject.Parse(raw)?["choices"]?[0]?["message"]?["content"]?.ToString()?.Trim() ?? "";
+
+                if (verdict.StartsWith("OK", StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Debug($"[AiModeration] Проверка {batch.Count} ответов: OK");
+                    return;
+                }
+
+                Log.Warn($"[AiModeration] KAT нашёл проблему: {verdict}");
+                await SendAlert(verdict, batch).ConfigureAwait(false);
+            }
+            catch (Exception e)
+            {
+                Log.Warn($"[AiModeration] Ошибка проверки: {e.Message}");
+            }
+        }
+
+        private static async Task SendAlert(string verdict, List<Entry> batch)
+        {
+            var cfg = Plugin.Instance.Config;
+            if (string.IsNullOrEmpty(cfg.AiModerationWebhookUrl))
+                return;
+
+            var desc = new StringBuilder();
+            desc.AppendLine("**Вердикт:** " + Trim(verdict, 500));
+            desc.AppendLine();
+            for (int i = 0; i < batch.Count; i++)
+                desc.AppendLine($"**{i + 1}. {batch[i].Nick}:** {Trim(batch[i].Question, 150)}");
+
+            var payload = new JObject
+            {
+                ["embeds"] = new JArray
+                {
+                    new JObject
+                    {
+                        ["title"] = "Надзор ИИ: подозрительный ответ Step",
+                        ["description"] = desc.ToString(),
+                        ["color"] = 15158332
+                    }
+                }
+            };
+
+            var content = new StringContent(payload.ToString(), Encoding.UTF8, "application/json");
+            await AiService.Http.PostAsync(cfg.AiModerationWebhookUrl, content).ConfigureAwait(false);
+        }
+
+        private static string Trim(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Length <= max ? s : s.Substring(0, max) + "...";
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Ai\AiPermissions.cs =====
+using System;
+using System.IO;
+using Exiled.API.Features;
+
+namespace EventHUD.Ai
+{
+    public enum AiPermissionLevel
+    {
+        None = 0,
+        Safe = 1,
+        Adm = 2,
+        FullAdm = 3
+    }
+
+    public static class AiPermissions
+    {
+        public static bool Safe { get; private set; } = true;
+        public static bool Adm { get; private set; }
+        public static bool FullAdm { get; private set; }
+
+        private static string FilePath => Path.Combine(Paths.Configs, "EventHUD-AiPerms.txt");
+
+        public static AiPermissionLevel GetLevel()
+        {
+            if (FullAdm) return AiPermissionLevel.FullAdm;
+            if (Adm) return AiPermissionLevel.Adm;
+            if (Safe) return AiPermissionLevel.Safe;
+            return AiPermissionLevel.None;
+        }
+
+        public static bool Set(string mode, bool value)
+        {
+            switch (mode.ToLowerInvariant())
+            {
+                case "safe": Safe = value; break;
+                case "adm": Adm = value; break;
+                case "fulladm": FullAdm = value; break;
+                default: return false;
+            }
+
+            Save();
+            return true;
+        }
+
+        public static string Status()
+        {
+            return $"safe: {(Safe ? "on" : "off")} | adm: {(Adm ? "on" : "off")} | fulladm: {(FullAdm ? "on" : "off")} | итоговый уровень: {GetLevel()}";
+        }
+
+        public static void Load()
+        {
+            try
+            {
+                if (!File.Exists(FilePath))
+                    return;
+
+                foreach (var line in File.ReadAllLines(FilePath))
+                {
+                    var parts = line.Split('=');
+                    if (parts.Length != 2)
+                        continue;
+
+                    bool value = parts[1].Trim() == "1";
+                    switch (parts[0].Trim())
+                    {
+                        case "safe": Safe = value; break;
+                        case "adm": Adm = value; break;
+                        case "fulladm": FullAdm = value; break;
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Warn($"[AiPermissions] Не удалось загрузить настройки: {e.Message}");
+            }
+        }
+
+        private static void Save()
+        {
+            try
+            {
+                File.WriteAllText(FilePath,
+                    $"safe={(Safe ? 1 : 0)}\nadm={(Adm ? 1 : 0)}\nfulladm={(FullAdm ? 1 : 0)}\n");
+            }
+            catch (Exception e)
+            {
+                Log.Warn($"[AiPermissions] Не удалось сохранить настройки: {e.Message}");
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Ai\AiService.cs =====
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+using Exiled.API.Features;
+using MEC;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+namespace EventHUD.Ai
+{
+    public static class AiService
+    {
+        private class ModelInfo
+        {
+            public string Label;
+            public string Model;
+            public string Description;
+            public string System;
+            public Func<string> ApiKey;
+        }
+
+        private static readonly Dictionary<string, ModelInfo> Models = new Dictionary<string, ModelInfo>
+        {
+            ["deepseek"] = new ModelInfo
+            {
+                Label = "Step 3.7 Flash",
+                Model = "step-3.7-flash",
+                Description = "Базовая модель, быстрая.",
+                System = null,
+                ApiKey = () => Cfg.AiApiKeyStep,
+            },
+            ["claudefable"] = new ModelInfo
+            {
+                Label = "KAT Coder Pro V2",
+                Model = "kat-coder-pro-v2",
+                Description = "Умная модель, самая лучшая на сервере.",
+                System = null,
+                ApiKey = () => Cfg.AiApiKeyKat,
+            },
+        };
+
+        internal static readonly HttpClient Http = CreateHttp();
+        private static readonly Dictionary<string, DateTime> LastUse = new Dictionary<string, DateTime>();
+        private static readonly Dictionary<string, List<(DateTime Ts, long Tokens)>> Usage = new Dictionary<string, List<(DateTime, long)>>();
+        private static readonly HashSet<string> Busy = new HashSet<string>();
+
+        private static Config Cfg => Plugin.Instance.Config;
+
+        private static HttpClient CreateHttp()
+        {
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            return new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
+        }
+
+        public static bool IsAdmin(Player player) =>
+            player.Group != null || player.RemoteAdminAccess;
+
+        public static string ModelList() =>
+            "Доступны: " + string.Join(" / ", Models.Keys);
+
+        public static bool HasModel(Player player) =>
+            AiModelStore.Get(player.UserId) != null;
+
+        public static string TrySelectLabel(Player player)
+        {
+            string key = AiModelStore.Get(player.UserId);
+            return key != null && Models.TryGetValue(key, out ModelInfo info) ? info.Label : "ИИ";
+        }
+
+        public static bool TrySelectModel(Player player, string key, out string response)
+        {
+            key = key.ToLowerInvariant().Trim();
+            if (!Models.TryGetValue(key, out ModelInfo info))
+            {
+                response = $"Нет такой модели. {ModelList()}";
+                return false;
+            }
+
+            AiModelStore.Set(player.UserId, key);
+            response = $"Модель: {info.Label}. {info.Description}";
+            return true;
+        }
+
+        public static string CheckAccess(Player player)
+        {
+            if (Busy.Contains(player.UserId))
+                return "Предыдущий запрос ещё обрабатывается, подожди.";
+
+            float cd = IsAdmin(player) ? Cfg.AiCooldownAdmin : Cfg.AiCooldownUser;
+            if (LastUse.TryGetValue(player.UserId, out DateTime last))
+            {
+                double left = cd - (DateTime.UtcNow - last).TotalSeconds;
+                if (left > 0)
+                    return $"КД: подожди ещё {left:F0} сек.";
+            }
+
+            long cap = IsAdmin(player) ? Cfg.AiTokenLimitAdmin : Cfg.AiTokenLimitUser;
+            if (UsedTokens(player.UserId) >= cap)
+                return $"Лимит {cap} токенов за 10 минут исчерпан, подожди.";
+
+            return null;
+        }
+
+        public static void Ask(Player player, string question)
+        {
+            Busy.Add(player.UserId);
+            LastUse[player.UserId] = DateTime.UtcNow;
+            Timing.RunCoroutine(AskRoutine(player, question));
+        }
+
+        private static IEnumerator<float> AskRoutine(Player player, string question)
+        {
+            string userId = player.UserId;
+            string modelKey = AiModelStore.Get(userId);
+            ModelInfo info = Models[modelKey];
+            bool isAdmin = IsAdmin(player);
+            int maxMemory = isAdmin ? Cfg.AiMemoryAdmin : Cfg.AiMemoryUser;
+
+            List<string> notes = AiMemoryService.Load(player);
+
+            Task<(string Answer, long Tokens, string Error)> task =
+                Task.Run(() => DoRequest(info, player, question, notes));
+
+            Console(player, "Ответ получен, идёт генерация");
+
+            DateTime start = DateTime.UtcNow;
+            float lastProgress = 0f;
+
+            while (!task.IsCompleted)
+            {
+                float elapsed = (float)(DateTime.UtcNow - start).TotalSeconds;
+
+                if (elapsed > Cfg.AiTimeoutSeconds)
+                {
+                    Console(player, $"Таймаут {Cfg.AiTimeoutSeconds} сек, попробуй ещё раз.");
+                    Busy.Remove(userId);
+                    yield break;
+                }
+
+                if (elapsed - lastProgress >= 3f)
+                {
+                    lastProgress = elapsed;
+                    Console(player, $"Генерация идёт {elapsed:F0} сек");
+                }
+
+                yield return Timing.WaitForSeconds(0.25f);
+            }
+
+            Busy.Remove(userId);
+
+            (string answer, long tokens, string error) = task.Result;
+            double took = (DateTime.UtcNow - start).TotalSeconds;
+
+            if (answer == null)
+            {
+                Console(player, $"Ошибка после 3 попыток: {Truncate(error, 400)}");
+                yield break;
+            }
+
+            answer = Truncate(answer, Cfg.AiMaxAnswerChars);
+            answer = AiActionExecutor.Process(player, answer, AiPermissions.GetLevel());
+
+            if (tokens <= 0)
+                tokens = (question.Length + answer.Length) / 3;
+
+            AddUsage(userId, tokens);
+            long cap = isAdmin ? Cfg.AiTokenLimitAdmin : Cfg.AiTokenLimitUser;
+            long left = Math.Max(0, cap - UsedTokens(userId));
+
+            notes.Add(AiMemoryService.Compress("Игрок", question));
+            notes.Add(AiMemoryService.Compress("ИИ", answer));
+
+            List<string> notesFinal = notes;
+            _ = Task.Run(() => AiMemoryService.Save(player, notesFinal, maxMemory));
+
+            foreach (string chunk in Chunks(answer, 1500))
+                Console(player, chunk);
+
+            if (modelKey == "deepseek")
+                AiModerationService.Enqueue(player.Nickname, question, answer);
+
+            Console(player, $"{info.Label} | потрачено {tokens} ток | {took:F1} сек | осталось {left} за 10 мин");
+        }
+
+        private static (string, long, string) DoRequest(ModelInfo info, Player player, string question, List<string> notes)
+        {
+            string lastError = "Пустой ответ";
+
+            string context = AiKnowledgeBase.Search(Http, question);
+            string content = string.IsNullOrEmpty(context)
+                ? question
+                : $"Информация из базы, используй только если относится к вопросу:\n{context}\n\nВопрос: {question}";
+
+            string system = AiContextBuilder.Build(player, string.Join("\n", notes), info.System);
+
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    var body = new
+                    {
+                        model = info.Model,
+                        messages = new object[]
+                        {
+                            new { role = "system", content = system },
+                            new { role = "user", content },
+                        },
+                        max_tokens = 4096,
+                        temperature = 1.0,
+                    };
+
+                    var req = new HttpRequestMessage(HttpMethod.Post, Cfg.AiBaseUrl.TrimEnd('/') + "/chat/completions")
+                    {
+                        Content = new StringContent(JsonConvert.SerializeObject(body), Encoding.UTF8, "application/json"),
+                    };
+                    req.Headers.TryAddWithoutValidation("Authorization", $"Bearer {info.ApiKey()}");
+
+                    HttpResponseMessage resp = Http.SendAsync(req).GetAwaiter().GetResult();
+                    string json = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        lastError = $"HTTP {(int)resp.StatusCode}: {Truncate(json, 300)}";
+                        continue;
+                    }
+
+                    JObject data = JObject.Parse(json);
+                    string answer = data["choices"]?[0]?["message"]?["content"]?.ToString();
+                    long tokens = data["usage"]?["total_tokens"]?.ToObject<long>() ?? 0;
+
+                    if (!string.IsNullOrWhiteSpace(answer))
+                        return (answer.Trim(), tokens, null);
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex.Message;
+                }
+            }
+
+            return (null, 0, lastError);
+        }
+
+        private static long UsedTokens(string userId)
+        {
+            if (!Usage.TryGetValue(userId, out var list))
+                return 0;
+
+            DateTime cutoff = DateTime.UtcNow.AddMinutes(-10);
+            list.RemoveAll(e => e.Ts < cutoff);
+            return list.Sum(e => e.Tokens);
+        }
+
+        private static void AddUsage(string userId, long tokens)
+        {
+            if (!Usage.TryGetValue(userId, out var list))
+                Usage[userId] = list = new List<(DateTime, long)>();
+            list.Add((DateTime.UtcNow, tokens));
+        }
+
+        private static void Console(Player player, string text)
+        {
+            try
+            {
+                player?.SendConsoleMessage(text, "white");
+            }
+            catch
+            {
+            }
+        }
+
+        private static string Truncate(string s, int max) =>
+            string.IsNullOrEmpty(s) || s.Length <= max ? s : s.Substring(0, max) + "...";
+
+        private static IEnumerable<string> Chunks(string s, int size)
+        {
+            for (int i = 0; i < s.Length; i += size)
+                yield return s.Substring(i, Math.Min(size, s.Length - i));
+        }
+
+        // ========== Админский ИИ (RA команда ai) ==========
+
+        private static readonly Dictionary<string, List<string>> AdminHistory = new Dictionary<string, List<string>>();
+
+        public static IEnumerator<float> AskAdminRoutine(Player player, string question)
+        {
+            var cfg = Plugin.Instance.Config;
+
+            string history = string.Empty;
+            if (AdminHistory.TryGetValue(player.UserId, out var hist) && hist.Count > 0)
+                history = string.Join("\n", hist);
+
+            string systemPrompt = AiContextBuilder.BuildAdmin(player, question, history);
+
+            var body = new Newtonsoft.Json.Linq.JObject
+            {
+                ["model"] = "step-3.7-flash",
+                ["max_tokens"] = 4096,
+                ["temperature"] = 0.7,
+                ["messages"] = new Newtonsoft.Json.Linq.JArray
+                {
+                    new Newtonsoft.Json.Linq.JObject { ["role"] = "system", ["content"] = systemPrompt },
+                    new Newtonsoft.Json.Linq.JObject { ["role"] = "user", ["content"] = question },
+                },
+            };
+
+            var task = System.Threading.Tasks.Task.Run(async () =>
+            {
+                using (var request = new System.Net.Http.HttpRequestMessage(
+                    System.Net.Http.HttpMethod.Post, cfg.AiBaseUrl.TrimEnd('/') + "/chat/completions"))
+                {
+                    request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + cfg.AiApiKeyStep);
+                    request.Content = new System.Net.Http.StringContent(
+                        body.ToString(), System.Text.Encoding.UTF8, "application/json");
+                    using (var resp = await Http.SendAsync(request).ConfigureAwait(false))
+                    {
+                        string text = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        if (!resp.IsSuccessStatusCode)
+                            return "__ERR__" + (int)resp.StatusCode + " " + text;
+                        return text;
+                    }
+              

@@ -1,0 +1,650 @@
+    {
+        private static readonly HashSet<string> Enabled = new HashSet<string>();
+
+        private const float ProximityRange = 15f;
+
+        public static bool IsEnabled(Player player)
+        {
+            return player != null && Enabled.Contains(player.UserId);
+        }
+
+        public static bool Toggle(Player player)
+        {
+            if (player == null)
+                return false;
+
+            if (Enabled.Remove(player.UserId))
+                return false;
+
+            Enabled.Add(player.UserId);
+            return true;
+        }
+
+        public static void Disable(Player player)
+        {
+            if (player != null)
+                Enabled.Remove(player.UserId);
+        }
+
+        public static void Remove(string userId)
+        {
+            if (!string.IsNullOrEmpty(userId))
+                Enabled.Remove(userId);
+        }
+
+        public static void Clear()
+        {
+            Enabled.Clear();
+        }
+
+        public static bool ShouldHear(Player speaker, Player listener)
+        {
+            // Если говорящего не удалось определить — не блокируем (пропускаем)
+            if (speaker == null || listener == null)
+                return true;
+
+            // Обычная речь — без ограничений
+            if (!speaker.IsScp)
+                return true;
+
+            // SCP говорит по прокси-каналу — его слышат только в радиусе и только если он ВКЛЮЧИЛ канал
+            if (!IsEnabled(speaker))
+                return false;
+
+            return Vector3.Distance(speaker.Position, listener.Position) <= ProximityRange;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Scp\ScpProximityVoiceFilter.cs =====
+using Exiled.API.Features;
+using Exiled.Events.EventArgs.Player;
+
+namespace EventHUD.Scp
+{
+    public sealed class ScpProximityVoiceFilter
+    {
+        public void OnReceivingVoiceMessage(ReceivingVoiceMessageEventArgs ev)
+        {
+            if (ev.Player == null)
+                return;
+
+            Player listener = ev.Player;
+            Player speaker = Player.Get(ev.VoiceMessage.Speaker);
+
+            if (!ScpProximityChat.ShouldHear(speaker, listener))
+                ev.IsAllowed = false;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Scp\ScpTeslaProtectionService.cs =====
+using System.Collections.Generic;
+using Exiled.API.Enums;
+using Exiled.API.Features;
+using Exiled.Events.EventArgs.Player;
+using PlayerRoles;
+using UnityEngine;
+
+namespace EventHUD.Scp
+{
+    public class ScpTeslaProtectionService
+    {
+        private const float Scp106TeslaRadius = 5f;
+        private const float ConcussionCooldown = 5f;
+
+        private static readonly HashSet<RoleTypeId> ImmuneRoles = new()
+        {
+            RoleTypeId.Scp3114,
+            RoleTypeId.Scp173,
+            RoleTypeId.Scp106,
+        };
+
+        private readonly Dictionary<int, float> _lastConcussion = new();
+
+        public void OnTriggeringTesla(TriggeringTeslaEventArgs ev)
+        {
+            if (ev.Player == null || ev.Tesla == null)
+                return;
+
+            if (!ImmuneRoles.Contains(ev.Player.Role.Type))
+                return;
+
+            // Запрещаем активацию теслы этим игроком
+            ev.IsAllowed = false;
+
+            // 106 получает Concussed при входе в радиус (с кулдауном)
+            if (ev.Player.Role.Type == RoleTypeId.Scp106)
+            {
+                float dist = Vector3.Distance(
+                    ev.Player.Position,
+                    ev.Tesla.Position);
+
+                if (dist <= Scp106TeslaRadius)
+                {
+                    int pid = ev.Player.Id;
+                    float now = Time.time;
+
+                    if (!_lastConcussion.TryGetValue(pid, out float last)
+                        || now - last >= ConcussionCooldown)
+                    {
+                        _lastConcussion[pid] = now;
+                        ev.Player.EnableEffect(EffectType.Concussed, 5f);
+                    }
+                }
+            }
+        }
+
+        public void OnHurting(HurtingEventArgs ev)
+        {
+            if (ev.Player == null)
+                return;
+
+            if (ev.DamageHandler.Type != DamageType.Tesla)
+                return;
+
+            if (ImmuneRoles.Contains(ev.Player.Role.Type))
+                ev.IsAllowed = false;
+        }
+
+        public void OnRoundRestart()
+        {
+            _lastConcussion.Clear();
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\BreakerGun.cs =====
+namespace EventHUD.SpecItems
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Reflection;
+    using EventHUD.Hud;
+    using Exiled.API.Enums;
+    using Exiled.API.Features;
+    using Exiled.API.Features.Attributes;
+    using Exiled.API.Features.Doors;
+    using Exiled.API.Features.Items;
+    using Exiled.API.Features.Spawn;
+    using Exiled.CustomItems.API.Features;
+    using Exiled.Events.EventArgs.Player;
+    using UnityEngine;
+
+    [CustomItem(ItemType.GunCOM15)]
+    public sealed class BreakerGun : CustomWeapon
+    {
+        private readonly Dictionary<ushort, bool> aiming = new Dictionary<ushort, bool>();
+
+        public override uint Id { get; set; } = 1;
+
+        public override string Name { get; set; } = "Ломатор";
+
+        public override string Description { get; set; } = "Без прицела ломает двери. С прицелом восстанавливает - стрелять в терминал у двери.";
+
+        public override ItemType Type { get; set; } = ItemType.GunCOM15;
+
+        public override float Weight { get; set; } = 0.6f;
+
+        public override float Damage { get; set; } = 0f;
+
+        public override byte ClipSize { get; set; } = 24;
+
+        public override SpawnProperties SpawnProperties { get; set; } = new SpawnProperties
+        {
+            Limit = 0,
+            DynamicSpawnPoints = new List<DynamicSpawnPoint>(),
+        };
+
+        public float RayDistance { get; set; } = 70f;
+
+        public float DoorHitRadius { get; set; } = 2.5f;
+
+        public float TerminalSearchRadius { get; set; } = 6f;
+
+        protected override void OnReloading(ReloadingWeaponEventArgs ev)
+        {
+            ev.IsAllowed = false;
+        }
+
+        public void OnAimingDownSight(AimingDownSightEventArgs ev)
+        {
+            if (ev.Firearm is null)
+                return;
+
+            aiming[ev.Firearm.Serial] = ev.AdsIn;
+        }
+
+        protected override void OnShooting(ShootingEventArgs ev)
+        {
+            base.OnShooting(ev);
+
+            Player player = ev.Player;
+
+            if (player is null)
+                return;
+
+            if (ev.Firearm != null)
+                ev.Firearm.MagazineAmmo = ClipSize;
+
+            bool ads = false;
+
+            if (!(ev.Firearm is null) && aiming.TryGetValue(ev.Firearm.Serial, out bool stored))
+                ads = stored;
+
+            Vector3 origin = player.CameraTransform.position;
+            Vector3 direction = player.CameraTransform.forward;
+
+            RaycastHit hit;
+
+            if (!Physics.Raycast(origin, direction, out hit, RayDistance))
+            {
+                HudNoticeService.Show(player, "Мимо", 1f, NoticePosition.Center);
+                return;
+            }
+
+            float radius = ads ? TerminalSearchRadius : DoorHitRadius;
+            Door door = FindNearestDoor(hit.point, radius);
+
+            if (door is null)
+            {
+                HudNoticeService.Show(player, ads ? "Рядом нет двери для ремонта" : "Это не дверь", 1.5f, NoticePosition.Center);
+                return;
+            }
+
+            BreakableDoor breakable = door as BreakableDoor;
+
+            if (breakable is null)
+            {
+                HudNoticeService.Show(player, "Эту дверь трогать нельзя", 1.5f, NoticePosition.Center);
+                SpecDebug.Log("ЛОМАТОР: " + door.Type + " не ломаемая, пропуск");
+                return;
+            }
+
+            if (ads)
+            {
+                bool ok = TryRepair(breakable);
+                HudNoticeService.Show(player, ok ? "<color=green>Дверь восстановлена</color>" : "<color=red>Не удалось восстановить</color>", 2f, NoticePosition.Center);
+                SpecDebug.Log("ЛОМАТОР ремонт " + door.Type + ": " + (ok ? "успех" : "ошибка"));
+            }
+            else
+            {
+                try
+                {
+                    breakable.Break();
+                    HudNoticeService.Show(player, "<color=orange>Дверь сломана</color>", 2f, NoticePosition.Center);
+                    SpecDebug.Log("ЛОМАТОР сломал " + door.Type);
+                }
+                catch (Exception e)
+                {
+                    SpecDebug.Log("ЛОМАТОР ошибка Break: " + e.Message);
+                }
+            }
+        }
+
+        private static Door FindNearestDoor(Vector3 point, float maxDistance)
+        {
+            Door best = null;
+            float bestDistance = float.MaxValue;
+
+            foreach (Door door in Door.List)
+            {
+                if (door is null)
+                    continue;
+
+                float distance = Vector3.Distance(door.Position, point);
+
+                if (distance < bestDistance)
+                {
+                    bestDistance = distance;
+                    best = door;
+                }
+            }
+
+            if (bestDistance > maxDistance)
+                return null;
+
+            return best;
+        }
+
+        private static bool TryRepair(BreakableDoor door)
+        {
+            try
+            {
+                PropertyInfo property = door.GetType().GetProperty("IsDestroyed");
+
+                if (!(property is null) && property.CanWrite)
+                {
+                    property.SetValue(door, false, null);
+                    SpecDebug.Log("ЛОМАТОР: ремонт через Door.IsDestroyed");
+                    return true;
+                }
+
+                MethodInfo repair = door.GetType().GetMethod("Repair", System.Type.EmptyTypes);
+
+                if (!(repair is null))
+                {
+                    repair.Invoke(door, null);
+                    SpecDebug.Log("ЛОМАТОР: ремонт через Door.Repair()");
+                    return true;
+                }
+
+                object baseDoor = door.Base;
+
+                if (baseDoor is null)
+                    return false;
+
+                System.Type baseType = baseDoor.GetType();
+                PropertyInfo netProperty = baseType.GetProperty("NetworkIsDestroyed");
+
+                if (!(netProperty is null) && netProperty.CanWrite)
+                {
+                    netProperty.SetValue(baseDoor, false, null);
+                    SpecDebug.Log("ЛОМАТОР: ремонт через NetworkIsDestroyed");
+                    return true;
+                }
+
+                FieldInfo field = baseType.GetField(
+                    "_destroyed",
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+                if (!(field is null))
+                {
+                    field.SetValue(baseDoor, false);
+                    SpecDebug.Log("ЛОМАТОР: ремонт через поле _destroyed");
+                    return true;
+                }
+
+                SpecDebug.Log("ЛОМАТОР: путь ремонта не найден. Тип двери = " + baseType.FullName);
+                return false;
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("ЛОМАТОР ошибка ремонта: " + e);
+                return false;
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\GrenadeLauncher.cs =====
+namespace EventHUD.SpecItems
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Linq;
+    using EventHUD.Hud;
+    using Exiled.API.Enums;
+    using Exiled.API.Features;
+    using Exiled.API.Features.Attributes;
+    using Exiled.API.Features.Items;
+    using Exiled.API.Features.Pickups.Projectiles;
+    using Exiled.API.Features.Spawn;
+    using Exiled.CustomItems.API.Features;
+    using Exiled.Events.EventArgs.Player;
+    using InventorySystem.Items.MicroHID.Modules;
+    using MEC;
+    using UnityEngine;
+
+    [CustomItem(ItemType.MicroHID)]
+    public sealed class GrenadeLauncher : CustomItem
+    {
+        private const float GrenadeSpeed = 10f;
+        private const float FastInterval = 0.2f;
+        private const float SlowInterval = 0.5f;
+        private const float FastPhaseDuration = 5f;
+
+        private static readonly Dictionary<string, float> SessionStart = new Dictionary<string, float>();
+        private static readonly Dictionary<string, float> NextShot = new Dictionary<string, float>();
+
+        private readonly HashSet<string> firingNow = new HashSet<string>();
+
+        private CoroutineHandle loop;
+
+        public override uint Id { get; set; } = 3;
+
+        public override ItemType Type { get; set; } = ItemType.MicroHID;
+
+        public override string Name { get; set; } = "Гранатомёт";
+
+        public override string Description { get; set; } = "МикроХИД, стреляющий гранатами";
+
+        public override float Weight { get; set; } = 25f;
+
+        public override SpawnProperties SpawnProperties { get; set; } = new SpawnProperties();
+
+        protected override void SubscribeEvents()
+        {
+            Exiled.Events.Handlers.Player.ChangingMicroHIDState += OnChangingPhase;
+            Exiled.Events.Handlers.Player.Hurting += OnHurting;
+            loop = Timing.RunCoroutine(FireLoop());
+            base.SubscribeEvents();
+            SpecDebug.Log("ГРАНАТОМЁТ: SubscribeEvents");
+        }
+
+        protected override void UnsubscribeEvents()
+        {
+            Exiled.Events.Handlers.Player.ChangingMicroHIDState -= OnChangingPhase;
+            Exiled.Events.Handlers.Player.Hurting -= OnHurting;
+            Timing.KillCoroutines(loop);
+            firingNow.Clear();
+            base.UnsubscribeEvents();
+            SpecDebug.Log("ГРАНАТОМЁТ: UnsubscribeEvents");
+        }
+
+        protected override void OnAcquired(Player player, Item item, bool displayMessage)
+        {
+            base.OnAcquired(player, item, displayMessage);
+
+            if (player == null || item == null)
+                return;
+
+            ushort serial = item.Serial;
+
+            Timing.CallDelayed(0.5f, () =>
+            {
+                try
+                {
+                    if (player == null || !player.IsConnected)
+                        return;
+
+                    SpecDebug.Log("МИКРОХИД: у " + player.Nickname + " гранатомётов в инвентаре");
+                }
+                catch (System.Exception e)
+                {
+                    SpecDebug.Log("МИКРОХИД лимит err: " + e.Message);
+                }
+            });
+        }
+
+        private void OnChangingPhase(ChangingMicroHIDStateEventArgs ev)
+        {
+            if (ev.Player == null || ev.MicroHID == null || !Check(ev.MicroHID))
+                return;
+
+            string id = ev.Player.UserId ?? ev.Player.Nickname;
+            SpecDebug.Log("МИКРОХИД " + ev.Player.Nickname + " фаза -> " + ev.NewPhase);
+
+            if (ev.NewPhase == MicroHidPhase.Firing)
+            {
+                float now = Time.time;
+                firingNow.Add(id);
+                SessionStart[id] = now;
+                NextShot[id] = now;
+            }
+            else
+            {
+                firingNow.Remove(id);
+            }
+        }
+
+        private void OnHurting(HurtingEventArgs ev)
+        {
+            if (ev.Attacker == null || ev.DamageHandler == null)
+                return;
+
+            if (ev.DamageHandler.Type != DamageType.MicroHid)
+                return;
+
+            if (!Check(ev.Attacker.CurrentItem))
+                return;
+
+            ev.IsAllowed = false;
+        }
+
+        private IEnumerator<float> FireLoop()
+        {
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(0.05f);
+
+                try
+                {
+                    Tick();
+                }
+                catch (Exception e)
+                {
+                    SpecDebug.Log("МИКРОХИД loop err: " + e.Message);
+                }
+            }
+        }
+
+        private void Tick()
+        {
+            float now = Time.time;
+
+            if (firingNow.Count == 0)
+                return;
+
+            List<string> ids = firingNow.ToList();
+
+            foreach (string id in ids)
+            {
+                Player player = Player.List.FirstOrDefault(p => (p.UserId ?? p.Nickname) == id);
+
+                if (player == null || !player.IsAlive || !Check(player.CurrentItem))
+                {
+                    firingNow.Remove(id);
+                    continue;
+                }
+
+                MicroHid micro = player.CurrentItem as MicroHid;
+
+                if (micro != null)
+                {
+                    try { micro.Energy = 1f; } catch { }
+                }
+
+                float next;
+                NextShot.TryGetValue(id, out next);
+
+                if (now < next)
+                    continue;
+
+                float started;
+                SessionStart.TryGetValue(id, out started);
+
+                float interval = now - started <= FastPhaseDuration ? FastInterval : SlowInterval;
+                NextShot[id] = now + interval;
+                FireGrenade(player);
+            }
+        }
+
+        private void FireGrenade(Player player)
+        {
+            try
+            {
+                Projectile projectile = player.ThrowGrenade(ProjectileType.FragGrenade, false).Projectile;
+
+                TimeGrenadeProjectile timed = projectile as TimeGrenadeProjectile;
+
+                if (timed != null)
+                    timed.FuseTime = 3f;
+
+                Vector3 direction = player.CameraTransform.forward;
+                projectile.Position = player.CameraTransform.position + direction * 0.7f;
+
+                Rigidbody body = projectile.GameObject.GetComponent<Rigidbody>();
+
+                if (body != null)
+                {
+                    body.velocity = direction * GrenadeSpeed;
+                    body.angularVelocity = Vector3.zero;
+                }
+
+                projectile.GameObject.AddComponent<NoPhysicsProjectile>();
+                projectile.GameObject.AddComponent<SpecGrenadeTag>();
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("МИКРОХИД выстрел err: " + e.Message);
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\GrenadeLauncherRp.cs =====
+namespace EventHUD.SpecItems
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Linq;
+    using EventHUD.Hud;
+    using Exiled.API.Enums;
+    using Exiled.API.Features;
+    using Exiled.API.Features.Attributes;
+    using Exiled.API.Features.Doors;
+    using Exiled.API.Features.Items;
+    using Exiled.API.Features.Pickups.Projectiles;
+    using Exiled.API.Features.Spawn;
+    using Exiled.CustomItems.API.Features;
+    using Exiled.Events.EventArgs.Player;
+    using MEC;
+    using UnityEngine;
+
+    [CustomItem(ItemType.GunShotgun)]
+    public sealed class GrenadeLauncherRp : CustomWeapon
+    {
+        private const int MaxLoaded = 6;
+        private const float NormalSpeed = 5f;
+        private const float AdsSpeed = 15f;
+        private const float FuseSeconds = 3f;
+
+        private static readonly Dictionary<ushort, int> Loaded = new Dictionary<ushort, int>();
+
+        private readonly HashSet<ushort> adsSerials = new HashSet<ushort>();
+
+        private readonly HashSet<ushort> reloadingNow = new HashSet<ushort>();
+
+        public override uint Id { get; set; } = 4;
+
+        public override ItemType Type { get; set; } = ItemType.GunShotgun;
+
+        public override string Name { get; set; } = "ГранатомётРП";
+
+        public override string Description { get; set; } = "Дробовик, заряжаемый гранатами";
+
+        public override float Weight { get; set; } = 2.5f;
+
+        public override SpawnProperties SpawnProperties { get; set; } = new SpawnProperties();
+
+        public override float Damage { get; set; } = 0f;
+
+        public override byte ClipSize { get; set; } = 6;
+
+        public void OnAimingDownSight(AimingDownSightEventArgs ev)
+        {
+            if (ev.Firearm == null || !Check(ev.Firearm))
+                return;
+
+            if (ev.AdsIn)
+                adsSerials.Add(ev.Firearm.Serial);
+            else
+                adsSerials.Remove(ev.Firearm.Serial);
+        }
+
+        protected override void OnAcquired(Player player, Item item, bool displayMessage)
+        {
+            base.OnAcquired(player, item, displayMessage);
+
+            if (player == null || item ==

@@ -1,0 +1,606 @@
+       {
+                    SpecDebug.Log("AUDIO: AddClip не найден");
+                    return;
+                }
+
+                object playback = addClip.Invoke(player, new object[] { alias, apiVolume, false, false });
+
+                SpecDebug.Log("AUDIO play " + fileName + " alias=" + alias + " vol=" + apiVolume.ToString("0.00")
+                    + " range=" + distance + " " + (playback != null ? "ok" : "null"));
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("AUDIO ошибка (" + fileName + "): " + e.Message);
+
+                if (e.InnerException != null)
+                    SpecDebug.Log("AUDIO inner: " + e.InnerException.Message);
+            }
+        }
+
+        private static void SetProperty(System.Type type, object target, string name, object value)
+        {
+            try
+            {
+                PropertyInfo property = type.GetProperty(name);
+
+                if (property != null && property.CanWrite)
+                    property.SetValue(target, value, null);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string EnsureClip(string fileName)
+        {
+            string alias = "spec_" + Path.GetFileNameWithoutExtension(fileName).ToLowerInvariant();
+
+            if (LoadedClips.Contains(alias))
+                return alias;
+
+            string full = Path.Combine(AudioDir, fileName);
+
+            if (!File.Exists(full))
+            {
+                SpecDebug.Log("AUDIO: нет файла " + full);
+                return null;
+            }
+
+            try
+            {
+                System.Type storage = AppDomain.CurrentDomain.GetAssemblies()
+                    .SelectMany(a =>
+                    {
+                        try
+                        {
+                            return a.GetTypes();
+                        }
+                        catch
+                        {
+                            return new System.Type[0];
+                        }
+                    })
+                    .FirstOrDefault(x => x.Name == "AudioClipStorage");
+
+                if (storage == null)
+                {
+                    SpecDebug.Log("AUDIO: AudioClipStorage не найден");
+                    return null;
+                }
+
+                MethodInfo loadClip = storage.GetMethod("LoadClip", new System.Type[] { typeof(string), typeof(string) });
+
+                if (loadClip == null)
+                {
+                    SpecDebug.Log("AUDIO: LoadClip не найден");
+                    return null;
+                }
+
+                loadClip.Invoke(null, new object[] { full, alias });
+                LoadedClips.Add(alias);
+                SpecDebug.Log("AUDIO загружен клип " + fileName + " -> " + alias);
+                return alias;
+            }
+            catch (Exception e)
+            {
+                SpecDebug.Log("AUDIO ошибка загрузки " + fileName + ": " + e.Message);
+                return null;
+            }
+        }
+
+        private static void InitTypes()
+        {
+            if (typesChecked)
+                return;
+
+            typesChecked = true;
+
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (!assembly.FullName.StartsWith("AudioPlayer"))
+                    continue;
+
+                audioPlayerType = assembly.GetType("AudioPlayer");
+                speakerType = assembly.GetType("Speaker");
+                break;
+            }
+
+            SpecDebug.Log("AUDIO InitTypes: AudioPlayer=" + (audioPlayerType == null ? "нет" : "есть")
+                + ", Speaker=" + (speakerType == null ? "нет" : "есть"));
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\SpecDebug.cs =====
+namespace EventHUD.SpecItems
+{
+    using System;
+    using System.IO;
+    using Exiled.API.Features;
+
+    public static class SpecDebug
+    {
+        private static readonly object Sync = new object();
+
+        public static string FilePath
+        {
+            get
+            {
+                return Path.Combine(Path.Combine(Paths.Configs, "EventHUD"), "debugitems.txt");
+            }
+        }
+
+        public static void Log(string text)
+        {
+            try
+            {
+                lock (Sync)
+                {
+                    string dir = Path.GetDirectoryName(FilePath);
+
+                    if (!Directory.Exists(dir))
+                        Directory.CreateDirectory(dir);
+
+                    File.AppendAllText(
+                        FilePath,
+                        "[" + DateTime.Now.ToString("dd.MM HH:mm:ss") + "] " + text + Environment.NewLine);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\SpecGrenadeTag.cs =====
+namespace EventHUD.SpecItems
+{
+    using UnityEngine;
+
+    public sealed class SpecGrenadeTag : MonoBehaviour
+    {
+        public static bool HasTag(GameObject obj)
+        {
+            return obj != null && obj.GetComponent<SpecGrenadeTag>() != null;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\SpecItems\TowerTeleporter.cs =====
+namespace EventHUD.SpecItems
+{
+    using System.Collections.Generic;
+    using EventHUD.Hud;
+    using MEC;
+    using Exiled.API.Enums;
+    using Exiled.API.Features;
+    using Exiled.API.Features.Attributes;
+    using Exiled.API.Features.Items;
+    using Exiled.API.Features.Spawn;
+    using Exiled.CustomItems.API.Features;
+    using Exiled.Events.EventArgs.Player;
+    using PlayerStatsSystem;
+    using UnityEngine;
+
+    [CustomItem(ItemType.GunCOM18)]
+    public sealed class TowerTeleporter : CustomWeapon
+    {
+        private readonly HashSet<ushort> adsSerials = new HashSet<ushort>();
+
+        public override uint Id { get; set; } = 2;
+
+        public override string Name { get; set; } = "??????????";
+
+        public override string Description { get; set; } = "????????????? ??????, ? ???????? ??????, ? ?????. 0 ?????.";
+
+        public override ItemType Type { get; set; } = ItemType.GunCOM18;
+
+        public override float Weight { get; set; } = 0.6f;
+
+        public override float Damage { get; set; } = 0f;
+
+        public override byte ClipSize { get; set; } = 24;
+
+        public override SpawnProperties SpawnProperties { get; set; } = new SpawnProperties
+        {
+            Limit = 0,
+            DynamicSpawnPoints = new List<DynamicSpawnPoint>(),
+        };
+
+        public float RayDistance { get; set; } = 200f;
+
+        public static void ResetState()
+        {
+        }
+
+        public void OnAimingDownSight(AimingDownSightEventArgs ev)
+        {
+            if (ev.Firearm is null)
+                return;
+
+            if (ev.AdsIn)
+                adsSerials.Add(ev.Firearm.Serial);
+            else
+                adsSerials.Remove(ev.Firearm.Serial);
+        }
+
+        protected override void OnShooting(ShootingEventArgs ev)
+        {
+            base.OnShooting(ev);
+
+            Player shooter = ev.Player;
+
+            if (shooter is null)
+                return;
+
+            Vector3 origin = shooter.CameraTransform.position;
+            Vector3 direction = shooter.CameraTransform.forward;
+
+            RaycastHit hit;
+
+            if (!Physics.Raycast(origin, direction, out hit, RayDistance))
+            {
+                HudNoticeService.Show(shooter, "????", 1f, NoticePosition.Center);
+                return;
+            }
+
+            Player target = null;
+
+            if (hit.collider != null)
+            {
+                // SCP:SL ?????????? HitboxIdentity ?? ????????? ???????
+                HitboxIdentity hitbox = hit.collider.GetComponentInParent<HitboxIdentity>();
+                if (hitbox != null && hitbox.TargetHub != null)
+                {
+                    target = Player.Get(hitbox.TargetHub);
+                }
+                else
+                {
+                    ReferenceHub hub = hit.collider.GetComponentInParent<ReferenceHub>();
+                    if (hub != null)
+                        target = Player.Get(hub);
+                }
+            }
+
+            if (target is null)
+            {
+                HudNoticeService.Show(shooter, "?????? ? ??????", 1.5f, NoticePosition.Center);
+                return;
+            }
+
+            if (target == shooter)
+            {
+                HudNoticeService.Show(shooter, "?????? ??????????????? ????", 1.5f, NoticePosition.Center);
+                return;
+            }
+
+            Vector3 towerPos = GetTowerPosition();
+
+            if (towerPos == Vector3.zero)
+            {
+                HudNoticeService.Show(shooter, "<color=red>?? ??????? ????? ?????</color>", 2f, NoticePosition.Center);
+                SpecDebug.Log("??????????: ?? ??????? ????? ?????");
+                return;
+            }
+
+            // godmode ?? ???? ??????, ????? ?? ????? ??? ???????
+            bool wasGod = target.IsGodModeEnabled;
+            target.IsGodModeEnabled = true;
+            target.Teleport(towerPos);
+            Timing.CallDelayed(1.5f, () =>
+            {
+                if (target != null && target.IsConnected)
+                    target.IsGodModeEnabled = wasGod;
+            });
+
+            HudNoticeService.Show(shooter, $"<color=lime>????? {target.Nickname} ?????????????? ? ?????</color>", 2f, NoticePosition.Center);
+            HudNoticeService.Show(target, "<color=orange>?? ??????????????? ? ????? ???????????????</color>", 3f, NoticePosition.Center);
+
+            SpecDebug.Log($"??????????: {shooter.Nickname} -> {target.Nickname} ? ?????");
+        }
+
+        private static Vector3 GetTowerPosition()
+        {
+            foreach (Room room in Room.List)
+            {
+                if (room.Type == RoomType.Surface)
+                    return room.Position + Vector3.up * 5f;
+            }
+
+            foreach (Room room in Room.List)
+            {
+                if (room.Name != null &&
+                    (room.Name.Contains("Tower", System.StringComparison.OrdinalIgnoreCase) ||
+                     room.Name.Contains("????", System.StringComparison.OrdinalIgnoreCase)))
+                {
+                    return room.Position + Vector3.up * 3f;
+                }
+            }
+
+            return new Vector3(0f, 100f, 0f);
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\TpsOptimizer\Config.cs =====
+namespace TpsOptimizer
+{
+    using System.ComponentModel;
+    using Exiled.API.Interfaces;
+
+    /// <summary>
+    /// Configuration for <see cref="Plugin"/>. Every value is exposed to the EXILED YAML config
+    /// so server owners can tune the optimizer without recompiling.
+    /// </summary>
+    public sealed class Config : IConfig
+    {
+        /// <summary>
+        /// Gets or sets a value indicating whether the plugin is enabled.
+        /// </summary>
+        [Description("Whether the plugin is enabled.")]
+        public bool IsEnabled { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether EXILED debug logging is enabled.
+        /// Cleanup logs (see <see cref="LogCleanups"/>) are written via Log.Debug, so this must be
+        /// enabled for them to appear.
+        /// </summary>
+        [Description("Whether debug logging is enabled.")]
+        public bool Debug { get; set; } = false;
+
+        // ===================== Ragdolls =====================
+
+        /// <summary>
+        /// Gets or sets the maximum number of ragdolls allowed on the map before the oldest are trimmed.
+        /// </summary>
+        [Description("Maximum number of ragdolls kept on the map; the oldest beyond this are removed.")]
+        public int MaxRagdolls { get; set; } = 15;
+
+        /// <summary>
+        /// Gets or sets the age, in seconds, after which a ragdoll becomes eligible for cleanup.
+        /// </summary>
+        [Description("Age in seconds after which a ragdoll is removed.")]
+        public float RagdollLifetime { get; set; } = 120f;
+
+        /// <summary>
+        /// Gets or sets the minimum age, in seconds, a ragdoll must reach before it can be touched.
+        /// Younger ragdolls are always kept (e.g. so SCP-049 can still recall recent bodies).
+        /// </summary>
+        [Description("Ragdolls younger than this (seconds) are never removed (SCP-049 protection).")]
+        public float RagdollSafeTime { get; set; } = 30f;
+
+        /// <summary>
+        /// Gets or sets how often, in seconds, the ragdoll cleanup pass runs.
+        /// </summary>
+        [Description("Ragdoll cleanup interval, in seconds.")]
+        public float RagdollCleanupInterval { get; set; } = 90f;
+
+        // ===================== Pickups =====================
+
+        /// <summary>
+        /// Gets or sets the maximum number of floor pickups allowed before the oldest are trimmed.
+        /// </summary>
+        [Description("Maximum number of floor items kept; the oldest beyond this are removed.")]
+        public int MaxPickups { get; set; } = 80;
+
+        /// <summary>
+        /// Gets or sets the age, in seconds, after which a pickup becomes eligible for cleanup.
+        /// </summary>
+        [Description("Age in seconds after which a floor item may be removed.")]
+        public float PickupLifetime { get; set; } = 300f;
+
+        /// <summary>
+        /// Gets or sets how often, in seconds, the pickup cleanup pass runs.
+        /// </summary>
+        [Description("Pickup cleanup interval, in seconds.")]
+        public float PickupCleanupInterval { get; set; } = 120f;
+
+        /// <summary>
+        /// Gets or sets the radius, in meters, used to detect a nearby player who would protect a pickup.
+        /// </summary>
+        [Description("If a player is within this radius (meters) of an old item, it is kept.")]
+        public float PickupSafeRadius { get; set; } = 15f;
+
+        /// <summary>
+        /// Gets or sets the age, in seconds, above which the nearby-player radius check is applied
+        /// before removing a pickup.
+        /// </summary>
+        [Description("Age in seconds above which the nearby-player radius check applies.")]
+        public float PickupAgeBeforeRadiusCheck { get; set; } = 120f;
+
+        // ===================== GC =====================
+
+        /// <summary>
+        /// Gets or sets how often, in seconds, the adaptive garbage collector evaluates TPS.
+        /// </summary>
+        [Description("Adaptive GC check interval, in seconds.")]
+        public float GcCheckInterval { get; set; } = 60f;
+
+        /// <summary>
+        /// Gets or sets the TPS threshold below which a light (gen 0) collection is triggered.
+        /// </summary>
+        [Description("Below this TPS a light gen-0 GC is triggered.")]
+        public float GcTpsThresholdSoft { get; set; } = 50f;
+
+        /// <summary>
+        /// Gets or sets the TPS threshold below which a gen 1 collection and low-latency mode are triggered.
+        /// </summary>
+        [Description("Below this TPS a gen-1 GC and SustainedLowLatency mode are triggered.")]
+        public float GcTpsThresholdMedium { get; set; } = 40f;
+
+        /// <summary>
+        /// Gets or sets the TPS threshold below which a full, forced, blocking collection is triggered.
+        /// </summary>
+        [Description("Below this TPS a full forced blocking GC is triggered.")]
+        public float GcTpsThresholdHard { get; set; } = 30f;
+
+        // ===================== Grenades =====================
+
+        /// <summary>
+        /// Gets or sets the maximum number of live grenades (HE/flash) allowed on the map at once.
+        /// </summary>
+        [Description("Maximum number of active grenades (HE/Flash) on the map at once.")]
+        public int MaxActiveGrenades { get; set; } = 15;
+
+        // ===================== Monitoring =====================
+
+        /// <summary>
+        /// Gets or sets a value indicating whether cleanup actions are logged (via Log.Debug).
+        /// </summary>
+        [Description("Whether cleanup actions are logged (requires Debug=true to be visible).")]
+        public bool LogCleanups { get; set; } = true;
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\TpsOptimizer\Plugin.cs =====
+namespace TpsOptimizer
+{
+    using System;
+    using Exiled.API.Features;
+    using TpsOptimizer.Optimizers;
+
+    /// <summary>
+    /// TPS optimization plugin for SCP: Secret Laboratory (EXILED 9.14.2).
+    /// <para>
+    /// This plugin ONLY optimizes server TPS. It never blocks commands, kicks, or bans, and is
+    /// designed to stay out of the way of admins running and managing the server.
+    /// </para>
+    /// </summary>
+    public sealed class Plugin : Plugin<Config>
+    {
+        /// <summary>
+        /// Gets the active plugin instance, for access from commands and services.
+        /// </summary>
+        public static Plugin Instance { get; private set; }
+
+        /// <inheritdoc/>
+        public override string Name => "TpsOptimizer";
+
+        /// <inheritdoc/>
+        public override string Author => "TpsOptimizer";
+
+        /// <inheritdoc/>
+        public override Version Version { get; } = new Version(1, 0, 0);
+
+        /// <inheritdoc/>
+        public override Version RequiredExiledVersion { get; } = new Version(9, 14, 2);
+
+        /// <summary>
+        /// Gets or sets the total number of ragdolls removed this session.
+        /// </summary>
+        public int TotalRagdollsCleaned { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total number of floor pickups removed this session.
+        /// </summary>
+        public int TotalPickupsCleaned { get; set; }
+
+        /// <summary>
+        /// Gets or sets the total number of garbage collections this plugin has triggered this session.
+        /// </summary>
+        public int TotalGcCalls { get; set; }
+
+        /// <summary>
+        /// Gets the UTC time at which the plugin was last enabled (used for the uptime readout).
+        /// </summary>
+        public DateTime StartTime { get; private set; }
+
+        /// <summary>
+        /// Gets the ragdoll auto-cleanup optimizer.
+        /// </summary>
+        public RagdollOptimizer RagdollOptimizer { get; private set; }
+
+        /// <summary>
+        /// Gets the floor-item auto-cleanup optimizer.
+        /// </summary>
+        public PickupOptimizer PickupOptimizer { get; private set; }
+
+        /// <summary>
+        /// Gets the adaptive garbage-collection optimizer.
+        /// </summary>
+        public GcOptimizer GcOptimizer { get; private set; }
+
+        /// <summary>
+        /// Gets the grenade-limit optimizer.
+        /// </summary>
+        public GrenadeOptimizer GrenadeOptimizer { get; private set; }
+
+        /// <summary>
+        /// Gets the round-lifecycle event handlers.
+        /// </summary>
+        public EventHandlers EventHandlers { get; private set; }
+
+        /// <inheritdoc/>
+        public override void OnEnabled()
+        {
+            Instance = this;
+            StartTime = DateTime.UtcNow;
+
+            RagdollOptimizer = new RagdollOptimizer(this);
+            PickupOptimizer = new PickupOptimizer(this);
+            GcOptimizer = new GcOptimizer(this);
+            GrenadeOptimizer = new GrenadeOptimizer(this);
+            EventHandlers = new EventHandlers(this);
+
+            Exiled.Events.Handlers.Server.RoundEnded += EventHandlers.OnRoundEnded;
+
+            RagdollOptimizer.Start();
+            PickupOptimizer.Start();
+            GcOptimizer.Start();
+            GrenadeOptimizer.Start();
+
+            Log.Info("TpsOptimizer v1.0.0 enabled.");
+
+            base.OnEnabled();
+        }
+
+        /// <inheritdoc/>
+        public override void OnDisabled()
+        {
+            if (EventHandlers != null)
+                Exiled.Events.Handlers.Server.RoundEnded -= EventHandlers.OnRoundEnded;
+
+            RagdollOptimizer?.Stop();
+            PickupOptimizer?.Stop();
+            GcOptimizer?.Stop();
+            GrenadeOptimizer?.Stop();
+
+            RagdollOptimizer = null;
+            PickupOptimizer = null;
+            GcOptimizer = null;
+            GrenadeOptimizer = null;
+            EventHandlers = null;
+            Instance = null;
+
+            Log.Info("TpsOptimizer disabled.");
+
+            base.OnDisabled();
+        }
+
+        /// <summary>
+        /// Stops and restarts every optimizer coroutine. Used by the <c>tpsreload</c> command so the
+        /// optimizers pick up the current config values without a full server restart.
+        /// </summary>
+        public void RestartOptimizers()
+        {
+            RagdollOptimizer?.Stop();
+            PickupOptimizer?.Stop();
+            GcOptimizer?.Stop();
+            GrenadeOptimizer?.Stop();
+
+            RagdollOptimizer?.Start();
+            PickupOptimizer?.Start();
+            GcOptimizer?.Start();
+            GrenadeOptimizer?.Start();
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\TpsOptimizer\obj\Debug\net48\.NETFramework,Version=v4.8.AssemblyAttributes.cs =====
+// <autogenerated />
+using System;
+using System.Reflection;
+[assembly: global::System.Runtime.Versioning.TargetFrameworkAttribute(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\TpsOptimizer\obj\Release\net48\.NETFra

@@ -1,0 +1,439 @@
+===== C:\Users\tkanu\Music\SCPSLSERVER\AfkWarning.cs =====
+using System;
+using System.Collections.Generic;
+using Exiled.API.Features;
+using MEC;
+using PlayerRoles;
+using UnityEngine;
+using PlayerEvents = Exiled.Events.Handlers.Player;
+
+namespace EventHUD
+{
+    /// <summary>Предупреждение об АФК: 5 минут без движения (0.3м) — бродкаст с обратным отсчётом до кика (кик в игре на 10 мин).</summary>
+    public static class AfkWarning
+    {
+        private const float WarnAfterSeconds = 300f;
+        private const float KickAtSeconds = 600f;
+        private const float MoveThreshold = 0.3f;
+
+        private class State { public Vector3 LastPos; public double IdleSince; }
+
+        private static readonly Dictionary<string, State> States = new Dictionary<string, State>();
+        private static CoroutineHandle _loop;
+
+        public static void Register()
+        {
+            PlayerEvents.Left += OnLeft;
+            if (!_loop.IsRunning)
+                _loop = Timing.RunCoroutine(Loop());
+        }
+
+        public static void Unregister()
+        {
+            PlayerEvents.Left -= OnLeft;
+            if (_loop.IsRunning)
+                Timing.KillCoroutines(_loop);
+            States.Clear();
+        }
+
+        private static void OnLeft(Exiled.Events.EventArgs.Player.LeftEventArgs ev) =>
+            States.Remove(ev.Player.UserId);
+
+        private static IEnumerator<float> Loop()
+        {
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(1f);
+                try { Tick(); } catch { }
+            }
+        }
+
+        private static void Tick()
+        {
+            double now = Timing.LocalTime;
+
+            foreach (Player player in Player.List)
+            {
+                // 079 не двигается, мёртвые/наблюдатели не в счёт
+                if (player.IsNPC || player.IsDead ||
+                    player.Role.Type == RoleTypeId.Scp079 || player.Role.Type == RoleTypeId.Overwatch)
+                {
+                    States.Remove(player.UserId);
+                    continue;
+                }
+
+                if (!States.TryGetValue(player.UserId, out State st))
+                {
+                    States[player.UserId] = new State { LastPos = player.Position, IdleSince = now };
+                    continue;
+                }
+
+                // Сдвинулся на 0.3м в любую сторону — таймер снимается
+                if (Vector3.Distance(player.Position, st.LastPos) >= MoveThreshold)
+                {
+                    st.LastPos = player.Position;
+                    st.IdleSince = now;
+                    continue;
+                }
+
+                double idle = now - st.IdleSince;
+                if (idle >= WarnAfterSeconds)
+                {
+                    int left = Math.Max(0, (int)(KickAtSeconds - idle));
+                    player.Broadcast(1, $"<color=red> AFK </color>Вы будете кикнуты через {left} секунд, подвигайтесь.",
+                        global::Broadcast.BroadcastFlags.Normal, true);
+                }
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Config.cs =====
+using System.ComponentModel;
+using Exiled.API.Interfaces;
+
+namespace EventHUD
+{
+    public sealed class Config : IConfig
+    {
+        [Description("Включён ли плагин")]
+        public bool IsEnabled { get; set; } = true;
+
+        [Description("Debug режим")]
+        public bool Debug { get; set; } = false;
+
+        // ===================== ОБЩИЙ РАЗМЕР ШРИФТА =====================
+
+        [Description("Базовый размер шрифта")]
+        public int BaseFontSize { get; set; } = 21;
+
+        // ===================== ЗАГОЛОВОК =====================
+
+        [Description("Текст заголовка")]
+        public string TitleText { get; set; } = "Aceline Events";
+
+        [Description("Цвет заголовка")]
+        public string TitleColor { get; set; } = "#C0C0C0";
+
+        [Description("Voffset заголовка")]
+        public float TitleVoffset { get; set; } = 32f;
+
+        [Description("Indent заголовка, %")]
+        public float TitleIndent { get; set; } = -29.3f;
+
+        // ===================== [id] [name] =====================
+
+        [Description("Voffset строки [id] [name]")]
+        public float NicknameVoffset { get; set; } = 31f;
+
+        [Description("Indent строки [id] [name], %")]
+        public float NicknameIndent { get; set; } = -29.9f;
+
+        [Description("Размер шрифта [id] [name]")]
+        public int NicknameFontSize { get; set; } = 21;
+
+        [Description("Максимальная длина РП имени персонажа")]
+        public int MaxRpNameLength { get; set; } = 24;
+
+        // ===================== CInfo =====================
+
+        [Description("Текст метки перед CInfo")]
+        public string RoleLabelText { get; set; } = "CInfo";
+
+        [Description("Voffset метки 'CInfo:'")]
+        public float RoleLabelVoffset { get; set; } = 30f;
+
+        [Description("Indent метки 'CInfo:', %")]
+        public float RoleLabelIndent { get; set; } = -29.5f;
+
+        [Description("Voffset значения CInfo")]
+        public float RoleValueVoffset { get; set; } = 30f;
+
+        [Description("Размер шрифта значения CInfo")]
+        public int RoleValueFontSize { get; set; } = 21;
+
+        [Description("Цвет значения CInfo")]
+        public string RoleValueColor { get; set; } = "#00FFFF";
+
+        // ===================== Статус ивента =====================
+
+        [Description("Базовое значение indent для формулы центрирования")]
+        public float EventIndentBase { get; set; } = 47f;
+
+        [Description("Наклон формулы — на сколько % менять indent за каждый символ")]
+        public float EventIndentSlope { get; set; } = 0.4f;
+
+        [Description("Voffset статуса ивента")]
+        public float EventVoffset { get; set; } = 33f;
+
+        [Description("Максимальная длина названия ивента")]
+        public int MaxEventNameLength { get; set; } = 20;
+
+        // ===================== AFK / отсутствие хоста =====================
+
+        [Description("Цвет текста статуса ивента, когда проводящий вышел")]
+        public string HostOfflineColor { get; set; } = "#555555";
+
+        [Description("Цвет текста статуса ивента при возврате проводящего")]
+        public string HostReturnColor { get; set; } = "#00FF00";
+
+        [Description("Длительность подсветки возврата проводящего, сек")]
+        public float HostReturnHighlightDuration { get; set; } = 3f;
+
+        [Description("Через сколько секунд бездействия RA считаем AFK")]
+        public int AfkThresholdSeconds { get; set; } = 120;
+
+        [Description("Текст AFK-режима")]
+        public string AfkText { get; set; } = "Сервер в AFK-режиме";
+
+        [Description("Цвет текста AFK-режима")]
+        public string AfkColor { get; set; } = "#555555";
+
+        // ===================== Эффект: короткий пульс =====================
+
+        [Description("Интервал короткого пульса, сек")]
+        public int MinutePulseIntervalSeconds { get; set; } = 60;
+
+        [Description("Длительность короткого пульса, сек")]
+        public float MinutePulseDuration { get; set; } = 2f;
+
+        [Description("Цвет короткого пульса (hex, без решётки)")]
+        public string MinutePulseColor { get; set; } = "FF4444";
+
+        // ===================== Эффект: сильный флеш =====================
+
+        [Description("Интервал сильного флеша, сек")]
+        public int ColorFlashIntervalSeconds { get; set; } = 300;
+
+        [Description("Длительность сильного флеша, сек")]
+        public float ColorFlashDuration { get; set; } = 2f;
+
+        [Description("Цвет сильного флеша (hex, без решётки)")]
+        public string ColorFlashColor { get; set; } = "FF0000";
+
+        // ===================== Эффекты: общее =====================
+
+        [Description("Количество цветовых шагов за цикл эффекта")]
+        public int EffectColorSteps { get; set; } = 20;
+
+        [Description("Как часто отправлять HUD во время эффекта, сек")]
+        public float EffectTickInterval { get; set; } = 0.15f;
+
+        // ===================== Прочее =====================
+
+        [Description("Интервал обновления HUD в обычном режиме, сек")]
+        public float HudUpdateInterval { get; set; } = 0.1f;
+
+        [Description("Показывать ли HUD по умолчанию")]
+        public bool HudEnabledByDefault { get; set; } = true;
+
+        [Description("Сколько секунд держать строку 'Ивент заканчивается' перед сбросом")]
+        public float StopLingerSeconds { get; set; } = 5f;
+
+        // ===================== Discord webhook =====================
+
+        [Description("Discord webhook URL для анонсов ивентов")]
+        public string DiscordWebhookUrl { get; set; } = "https://discord.com/api/webhooks/1533312066428076162/5Nx4zrHWVmsIB3RruJ4Uj-EKd9Ht8PJC0G8HmPpbsEqnCcI0C8_PJnXqYNfLwMY6-T0o";
+
+        [Description("SteamID64 -> Discord ID проводящих (для упоминания в анонсах)")]
+        public System.Collections.Generic.Dictionary<string, ulong> HostDiscordIds { get; set; } = new System.Collections.Generic.Dictionary<string, ulong>
+        {
+            ["76561198732542518"] = 1475815739322663012,
+            ["76561199684226286"] = 1423620904885424209,
+            ["76561199854447494"] = 1346501845983563838,
+            ["76561199683685990"] = 1147134931487694881,
+            ["76561199388087145"] = 1064117343715864656,
+            ["76561199687703494"] = 1362329625992364053,
+        };
+
+        // ===================== ИИ-ассистент (.ai) =====================
+
+        [Description("Ключ API для модели kat-coder-pro-v2 (бывш. ультра)")]
+        public string AiApiKeyKat { get; set; } = "sk-zBAOGP6zU5yvvVkCCZNrqWij9ltJ3coKnBHvJP5VF62nRyWO";
+
+        [Description("Ключ API для модели step-3.7-flash (бывш. deepseek)")]
+        public string AiApiKeyStep { get; set; } = "sk-6LOyaqYaLFfrdHYDrTdGsG6HmXplFvYCr4ktjpEcQT7HWsCj";
+
+        [Description("Base URL API для .ai")]
+        public string AiBaseUrl { get; set; } = "https://api.hcnsec.cn/v1";
+
+        [Description("URL базы знаний для .ai (pastebin raw)")]
+        public string AiKnowledgeUrl { get; set; } = "https://pastebin.com/raw/XV9vLYab";
+
+        [Description("КД .ai для обычных игроков (сек)")]
+        public float AiCooldownUser { get; set; } = 30f;
+
+        [Description("КД .ai для админов (сек)")]
+        public float AiCooldownAdmin { get; set; } = 10f;
+
+        [Description("Лимит токенов за 10 минут: юзер")]
+        public long AiTokenLimitUser { get; set; } = 5000000;
+
+        [Description("Лимит токенов за 10 минут: админ")]
+        public long AiTokenLimitAdmin { get; set; } = 30000000;
+
+        [Description("Сообщений памяти: юзер")]
+        public int AiMemoryUser { get; set; } = 30;
+
+        [Description("Сообщений памяти: админ")]
+        public int AiMemoryAdmin { get; set; } = 100;
+
+        [Description("Макс. символов в ответе .ai")]
+        public int AiMaxAnswerChars { get; set; } = 5000;
+
+        [Description("Таймаут генерации .ai (сек)")]
+        public int AiTimeoutSeconds { get; set; } = 300;
+
+        [Description("Команды, доступные ИИ в режиме adm (первое слово команды, в нижнем регистре)")]
+        public System.Collections.Generic.List<string> AiAdmCommands { get; set; } = new System.Collections.Generic.List<string>
+        {
+            "give", "forceclass", "fc", "effect", "heal", "cassie", "cassieadv", "kit"
+        };
+
+        [Description("Команды, запрещённые ИИ всегда, даже в режиме fulladm")]
+        public System.Collections.Generic.List<string> AiBlockedCommands { get; set; } = new System.Collections.Generic.List<string>
+        {
+            "ban", "oban", "offlineban", "unban", "pardon", "kick", "mute", "unmute", "warn",
+            "config", "serverconfig", "warhead", "detonation_start", "detonation_instant",
+            "server_event", "roundrestart", "softrestart", "forcestart"
+        };
+
+        [Description("Максимум команд за один ответ ИИ")]
+        public int AiMaxCommandsPerAnswer { get; set; } = 3;
+
+        [Description("Максимум команд за один ответ админского ИИ")]
+        public int AiAdminMaxCommands { get; set; } = 10;
+
+        [Description("Включить надзор: kat проверяет ответы step")]
+        public bool AiModerationEnabled { get; set; } = true;
+
+        [Description("Проверять каждые N ответов deepseek")]
+        public int AiModerationEvery { get; set; } = 5;
+
+        [Description("Вебхук Discord для алертов надзора (пусто = только лог в консоль сервера)")]
+        public string AiModerationWebhookUrl { get; set; } = string.Empty;
+
+        [Description("Киты для команды kit: название -> список предметов")]
+        public System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<ItemType>> AiKits { get; set; } = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<ItemType>>
+        {
+            ["medic"] = new System.Collections.Generic.List<ItemType> { ItemType.Medkit, ItemType.Painkillers, ItemType.Adrenaline, ItemType.SCP500 },
+            ["guard"] = new System.Collections.Generic.List<ItemType> { ItemType.GunFSP9, ItemType.ArmorLight, ItemType.Medkit, ItemType.Radio },
+            ["mtf"] = new System.Collections.Generic.List<ItemType> { ItemType.GunE11SR, ItemType.ArmorCombat, ItemType.Medkit, ItemType.Radio, ItemType.KeycardMTFOperative },
+            ["chaos"] = new System.Collections.Generic.List<ItemType> { ItemType.GunAK, ItemType.ArmorCombat, ItemType.Medkit, ItemType.Painkillers },
+        };
+
+        [Description("Вебхук Discord для .call (staff канал). Пусто = не отправлять в Discord")]
+        public string CallWebhookUrl { get; set; } = "https://discord.com/api/webhooks/1533312265296547920/ecmgZ0SrZSdrQwz4I-fh2RpI8-aAiVyQfRkSw8OEtWu3k5sqdlv7xokk9tL-Q7qlFLzn";
+
+        [Description("Webhook для логов команд")]
+        public string CommandLogWebhookUrl { get; set; } = "https://discord.com/api/webhooks/1529133793821327420/fm7U9UvAgaQOCCBm78KauRyakiWP59RYtgBp0N4JGhS938MHdNeQU1Qe5IV94uD9mlwG";
+
+        [Description("Webhook для игровых логов (коннекты, урон, киллы)")]
+        public string GameLogWebhookUrl { get; set; } = "https://discord.com/api/webhooks/1529382912795873400/s17NOx9fgxoSjWEKUVJg2-Rq5EvJrZpDoQu8sM6GfDq5WHwrEjeNDGGQsqcXtAxnhIkN";
+
+        [Description("Webhook для логов модерации (баны, кики, муты)")]
+        public string ModerationLogWebhookUrl { get; set; } = "https://discord.com/api/webhooks/1529385704797245470/Es5ISAvLCi-7J05UXOzJWCixFu9-p98vPMmyM0zARByXjInHdv5BMyqKRzNSC8fR6Gcp";
+
+        [Description("Настройки звуков: ключ = имя ogg-файла без расширения из папки Configs/EventHUD/Audio")]
+        public System.Collections.Generic.Dictionary<string, Audio.SoundSettings> Sounds { get; set; } = new System.Collections.Generic.Dictionary<string, Audio.SoundSettings>
+        {
+            ["tripwire"] = new Audio.SoundSettings
+            {
+                Enabled = true,
+                IsSpatial = true,
+                Volume = 1f,
+                MinDistance = 3f,
+                MaxDistance = 25f,
+                OffsetX = 0f,
+                OffsetY = 0f,
+                OffsetZ = 0f,
+            },
+        };
+
+        // ===================== RP-модуль: Рация =====================
+
+        [Description("Минимальная допустимая частота рации")]
+        public float RadioFreqMin { get; set; } = 10.0f;
+
+        [Description("Максимальная допустимая частота рации")]
+        public float RadioFreqMax { get; set; } = 390.0f;
+
+        [Description("Частота волны '?'")]
+        public float RadioFreqUnknown { get; set; } = 15.0f;
+
+        [Description("Частота волны 'Комплекс'")]
+        public float RadioFreqFacility { get; set; } = 95.0f;
+
+        [Description("Частота волны 'СБ'")]
+        public float RadioFreqSecurity { get; set; } = 150.0f;
+
+        [Description("Частота волны 'МОГ'")]
+        public float RadioFreqMtf { get; set; } = 200.0f;
+
+        [Description("Частота волны 'ПХ'")]
+        public float RadioFreqChaos { get; set; } = 250.0f;
+
+        [Description("Текст строки волны рации в HUD")]
+        public string RadioWaveLabel { get; set; } = "Волна рации";
+
+        [Description("Voffset строки волны рации")]
+        public float RadioWaveVoffset { get; set; } = 59f;
+
+        [Description("Indent строки волны рации, %")]
+        public float RadioWaveIndent { get; set; } = -29.5f;
+
+        [Description("Шаблон хинта смены режима. {0}=цвет, {1}=название")]
+        public string RadioSwitchHintTemplate { get; set; } = "Переключен режим рации: <color={0}>{1}</color>";
+
+        [Description("Voffset хинта смены режима")]
+        public float RadioSwitchHintVoffset { get; set; } = 15f;
+
+        [Description("Indent хинта смены режима, %")]
+        public float RadioSwitchHintIndent { get; set; } = 26f;
+
+        [Description("Размер шрифта хинта смены режима")]
+        public int RadioSwitchHintFontSize { get; set; } = 21;
+
+        [Description("Длительность хинта смены режима, сек")]
+        public float RadioSwitchHintDuration { get; set; } = 1f;
+
+        [Description("ID слайдера Radio HZ в Server-Specific Settings (не менять без причины)")]
+        public int RadioHzSettingId { get; set; } = 9001;
+
+        // ===================== RP-модуль: Медицина =====================
+
+        [Description("Порог передоза адреналином (кол-во за жизнь)")]
+        public int AdrenalineOverdoseThreshold { get; set; } = 3;
+
+        [Description("Порог передоза обезболивающим (кол-во за жизнь)")]
+        public int PainkillerOverdoseThreshold { get; set; } = 4;
+
+        [Description("Длительность эффектов передоза, сек")]
+        public float OverdoseEffectDuration { get; set; } = 25f;
+
+        [Description("Intensity Slowness при передозе")]
+        public byte OverdoseSlownessIntensity { get; set; } = 55;
+
+        [Description("Intensity Asphyxiated при передозе")]
+        public byte OverdoseAsphyxiatedIntensity { get; set; } = 25;
+
+        [Description("Макс. урон от гранаты для капиллярного кровотечения")]
+        public float LightBleedGrenadeMaxDamage { get; set; } = 10f;
+
+        [Description("Макс. урон от падения для капиллярного кровотечения")]
+        public float LightBleedFallMaxDamage { get; set; } = 15f;
+
+        [Description("Длит. Concussed при капиллярном, сек")]
+        public float LightBleedConcussedDuration { get; set; } = 5f;
+
+        [Description("Урон/сек бурной фазы капиллярного")]
+        public float LightBleedBurstDps { get; set; } = 2f;
+
+        [Description("Длительность бурной фазы капиллярного, сек")]
+        public float LightBleedBurstDuration { get; set; } = 5f;
+
+        [Description("Урон пассивной фазы капиллярного за интервал")]
+        public float LightBleedPassiveDps { get; set; } = 1f;
+
+        [Description("Интервал пассивной фазы капиллярного, сек")]
+        pub

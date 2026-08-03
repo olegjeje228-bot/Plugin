@@ -1,0 +1,574 @@
+     float modifiedDamage = ArmorDamageProcessor.ProcessFirearmDamage(
+                        ev.Player, ev.Attacker, damage, damageType, hitbox, penetration,
+                        out bool shouldApplyInjury, out bool isLethalHeadshot);
+
+                    ev.Amount = modifiedDamage;
+
+                    if (isLethalHeadshot)
+                    {
+                        ev.Amount = 0;
+                        return;
+                    }
+
+                    if (shouldApplyInjury)
+                    {
+                        var weaponItem = DamageTypeToItemType(damageType);
+                        InjuryApplier.ProcessFirearmDamage(ev.Player, modifiedDamage,
+                            weaponItem ?? ItemType.GunCOM18, hitbox);
+                    }
+                    break;
+                }
+
+                case DamageType.Explosion:
+                    InjuryApplier.ProcessExplosionDamage(ev.Player, damage);
+                    break;
+
+                case DamageType.Falldown:
+                    InjuryApplier.ProcessFallDamage(ev.Player, damage);
+                    InjuryApplier.ProcessDamage(ev.Player, damage, damageType, hitbox);
+                    break;
+
+                // ── SCP ──
+                case DamageType.Scp939:
+                case DamageType.Scp096:
+                case DamageType.Scp049:
+                case DamageType.Scp0492:
+                case DamageType.Scp3114:
+                case DamageType.Strangled:
+                case DamageType.Scp:
+                {
+                    float scpDamage = ArmorDamageProcessor.ProcessScpDamage(
+                        ev.Player, damage, damageType, out bool shouldApplyInjury);
+                    ev.Amount = scpDamage;
+                    if (shouldApplyInjury)
+                        InjuryApplier.ProcessScpDamage(ev.Player, scpDamage, damageType, hitbox);
+                    break;
+                }
+
+                case DamageType.Jailbird:
+                {
+                    float jbDamage = ArmorDamageProcessor.ProcessScpDamage(
+                        ev.Player, damage, damageType, out bool shouldApplyInjury);
+                    ev.Amount = jbDamage;
+                    if (shouldApplyInjury)
+                        InjuryApplier.ProcessJailbirdDamage(ev.Player, hitbox);
+                    break;
+                }
+
+                case DamageType.MicroHid:
+                    // Не даём ожог себе при стрельбе из Micro-HID
+                    if (ev.Attacker == null || ev.Attacker.Id != ev.Player.Id)
+                        InjuryApplier.ProcessMicroHidDamage(ev.Player, hitbox);
+                    break;
+
+                case DamageType.PocketDimension:
+                    InjuryApplier.ApplyCorrosion(ev.Player);
+                    break;
+            }
+        }
+
+        public void OnUsedItem(UsedItemEventArgs ev)
+        {
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                return;
+
+            if (ev.Player == null)
+                return;
+
+            switch (ev.Item.Type)
+            {
+                case ItemType.Adrenaline:
+                    InjuryApplier.ProcessAdrenalineUse(ev.Player);
+                    break;
+                case ItemType.Painkillers:
+                    InjuryApplier.ProcessPainkillerUse(ev.Player);
+                    break;
+                case ItemType.SCP500:
+                    ProcessScp500Use(ev.Player);
+                    break;
+                case ItemType.Medkit:
+                    if (!Rpm.FullRpState.IsEnabled)
+                        Plugin.Instance.SimpleMedkit?.OnMedkitUsed(ev.Player, ev.Item.Serial);
+                    break;
+            }
+        }
+
+        public void OnUsingItem(UsingItemEventArgs ev)
+        {
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                return;
+
+            if (ev.Player == null)
+                return;
+
+            if (ev.Item.Type == ItemType.Medkit && Rpm.FullRpState.IsEnabled)
+                ev.IsAllowed = false;
+        }
+
+        [Obsolete]
+        public void OnItemAdded(ItemAddedEventArgs ev)
+        {
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                return;
+
+            if (ev.Player == null || ev.Item == null)
+                return;
+
+            // Медкит
+            if (ev.Item.Type == ItemType.Medkit)
+            {
+                if (!MedkitInventoryStorage.TryGet(ev.Item.Serial, out _))
+                {
+                    // Задержка — при спавне роль может быть ещё не установлена
+                    ushort serial = ev.Item.Serial;
+                    Player playerRef = ev.Player;
+                    MEC.Timing.CallDelayed(0.5f, () =>
+                    {
+                        try
+                        {
+                            if (playerRef == null || !playerRef.IsAlive) return;
+                            if (MedkitInventoryStorage.TryGet(serial, out _)) return;
+                            var type = MedkitTypeAssigner.GetByRole(playerRef);
+                            MedkitInventoryStorage.Set(serial, MedkitInventory.Create(type));
+                        }
+                        catch { }
+                    });
+                }
+                return;
+            }
+
+            // Бронежилет
+            if (ev.Item.Type == ItemType.ArmorLight ||
+                ev.Item.Type == ItemType.ArmorCombat ||
+                ev.Item.Type == ItemType.ArmorHeavy)
+            {
+                ArmorState armorState =
+                    ArmorStorage.GetOrCreate(ev.Player.UserId);
+
+                if (armorState.Type == ArmorType.None)
+                {
+                    armorState.SetType(
+                        AssignArmorType(ev.Player, ev.Item.Type));
+                }
+
+                if (ArmorItemDurabilityStorage.TryGet(
+                        ev.Item.Serial,
+                        out float savedDurability))
+                {
+                    armorState.Durability = savedDurability;
+                }
+
+                if (ArmorItemDurabilityStorage.TryGetHelmetDurability(
+                        ev.Item.Serial,
+                        out int savedHelmetDurability))
+                {
+                    armorState.HelmetDurability = savedHelmetDurability;
+                }
+
+                if (armorState.Type != ArmorType.Helmet &&
+                    armorState.Durability > 0f)
+                {
+                    ApplyArmorShield(ev.Player, armorState.Type);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Устанавливает синий броне-щит (Hume Shield) по типу брони.
+        /// Не восстанавливается (у людей нет HS-регена), но принимает урон.
+        /// Применяется с задержкой, чтобы пережить сброс стата при спавне.
+        /// </summary>
+        [Obsolete]
+
+        public static void ApplyArmorShield(Player player, ArmorType type)
+        {
+            float shield = type.GetArmorShield();
+            if (shield <= 0f) return;
+
+            MEC.Timing.CallDelayed(0.5f, () =>
+            {
+                if (player == null || !player.IsAlive) return;
+                try
+                {
+                    player.HumeShieldStat.MaxValue = shield;
+                    player.HumeShield = shield;
+                }
+                catch { }
+            });
+        }
+
+        public void OnDied(DiedEventArgs ev)
+        {
+            if (ev.Player == null)
+                return;
+
+            // Anti-абьюз: при смерти от Pit Death снимаем 50% патронов и удаляем мячики
+            if (ev.DamageHandler.Type == DamageType.Falldown ||
+                ev.DamageHandler.Type.ToString().ToLowerInvariant().Contains("pit"))
+            {
+                RemoveHalfAmmo(ev.Player);
+                RemoveCandies(ev.Player);
+            }
+
+            MedicalStorage.GetOrCreate(ev.Player.UserId).Reset();
+            Plugin.Instance.InjuryTicks?.ResetPlayer(ev.Player.UserId);
+            ArmorStorage.Remove(ev.Player.UserId);
+            Plugin.Instance.CritState?.Cancel(ev.Player.UserId);
+            Plugin.Instance.SimpleMedkit?.ResetPlayer(ev.Player.UserId);
+        }
+
+        private void RemoveHalfAmmo(Player player)
+        {
+            try
+            {
+                var ammoItems = player.Items
+                    .Where(i => i != null && IsAmmoType(i.Type))
+                    .ToList();
+
+                int toRemove = ammoItems.Count / 2;
+                for (int i = 0; i < toRemove; i++)
+                {
+                    ammoItems[i].Destroy();
+                }
+            }
+            catch { }
+        }
+
+        private void RemoveCandies(Player player)
+        {
+            try
+            {
+                foreach (var item in player.Items.ToList())
+                {
+                    if (item != null && item.Type == ItemType.SCP330)
+                        item.Destroy();
+                }
+            }
+            catch { }
+        }
+
+        private bool IsAmmoType(ItemType type)
+        {
+            return type == ItemType.Ammo556x45 ||
+                   type == ItemType.Ammo762x39 ||
+                   type == ItemType.Ammo9x19 ||
+                   type == ItemType.Ammo12gauge ||
+                   type == ItemType.Ammo44cal;
+        }
+
+        public void OnChangingRole(ChangingRoleEventArgs ev)
+        {
+            if (ev.Player == null)
+                return;
+
+            if (ev.NewRole != PlayerRoles.RoleTypeId.Spectator &&
+                ev.NewRole != PlayerRoles.RoleTypeId.None)
+            {
+                MedicalStorage.GetOrCreate(ev.Player.UserId).Reset();
+                Plugin.Instance.InjuryTicks?.ResetPlayer(ev.Player.UserId);
+                ArmorStorage.Remove(ev.Player.UserId);
+                Plugin.Instance.CritState?.Cancel(ev.Player.UserId);
+                Plugin.Instance.SimpleMedkit?.ResetPlayer(ev.Player.UserId);
+            }
+        }
+
+        public void OnReceivingEffect(ReceivingEffectEventArgs ev)
+        {
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                return;
+
+            if (ev.Player == null)
+                return;
+
+            if (ev.Effect is CustomPlayerEffects.CardiacArrest && ev.Intensity > 0)
+                MedicalStorage.GetOrCreate(ev.Player.UserId).AddCondition(GlobalCondition.CardiacArrest);
+        }
+
+        public void OnDroppingItem(DroppingItemEventArgs ev)
+        {
+            if (ev.Player == null || ev.Item == null) return;
+
+            if (ev.Item.Type != ItemType.ArmorLight &&
+                ev.Item.Type != ItemType.ArmorCombat &&
+                ev.Item.Type != ItemType.ArmorHeavy)
+                return;
+
+            if (!ArmorStorage.TryGet(
+                    ev.Player.UserId,
+                    out ArmorState armorState) ||
+                armorState.Type == ArmorType.None)
+            {
+                return;
+            }
+
+            ArmorItemDurabilityStorage.Set(
+                ev.Item.Serial,
+                armorState.Durability,
+                armorState.HelmetDurability);
+
+            armorState.Reset();
+        }
+
+        public void OnEnteringPocketDimension(EnteringPocketDimensionEventArgs ev)
+        {
+            if (!RpModuleManager.Instance.IsEnabled(RpModuleType.Medicine))
+                return;
+
+            if (ev.Player == null)
+                return;
+
+            InjuryApplier.ApplyCorrosion(ev.Player);
+        }
+
+        // ═══════════════════════════════════════
+
+        private void ProcessScp500Use(Player player)
+        {
+            var state = MedicalStorage.GetOrCreate(player.UserId);
+            var toRemove = new System.Collections.Generic.List<GlobalCondition>();
+            foreach (var cond in state.Conditions)
+            {
+                if (cond != GlobalCondition.Normal && cond != GlobalCondition.LethalHeadshot)
+                    toRemove.Add(cond);
+            }
+            foreach (var cond in toRemove)
+                state.RemoveCondition(cond);
+
+            state.Injuries.RemoveAll(i => i.Type != LocalInjuryType.Corrosion);
+            Plugin.Instance.InjuryTicks?.ResetPlayer(player.UserId);
+        }
+
+        private static ArmorType AssignArmorType(
+            Player player,
+            ItemType itemType)
+        {
+            if (itemType == ItemType.ArmorHeavy &&
+                player.Role.Type == PlayerRoles.RoleTypeId.NtfCaptain)
+            {
+                return ArmorType.Tank;
+            }
+
+            return itemType switch
+            {
+                ItemType.ArmorLight => ArmorType.Helmet,
+                ItemType.ArmorCombat => ArmorType.Combat,
+                ItemType.ArmorHeavy => ArmorType.Heavy,
+                _ => ArmorType.None
+            };
+        }
+
+        private static float GetDefaultPenetration(DamageType dt) => dt switch
+        {
+            DamageType.Com15    => 0.20f,
+            DamageType.Com18    => 0.55f,
+            DamageType.Com45    => 0.55f,
+            DamageType.Fsp9     => 0.45f,
+            DamageType.Crossvec => 0.40f,
+            DamageType.E11Sr    => 0.70f,
+            DamageType.AK       => 0.80f,
+            DamageType.Logicer  => 0.75f,
+            DamageType.Frmg0    => 0.85f,
+            DamageType.A7       => 0.65f,
+            DamageType.Shotgun  => 0.60f,
+            DamageType.Revolver => 0.65f,
+            _                   => 0.50f
+        };
+
+        private static ItemType? DamageTypeToItemType(DamageType dt) => dt switch
+        {
+            DamageType.Com15    => ItemType.GunCOM15,
+            DamageType.Com18    => ItemType.GunCOM18,
+            DamageType.Com45    => ItemType.GunCom45,
+            DamageType.Revolver => ItemType.GunRevolver,
+            DamageType.Fsp9     => ItemType.GunFSP9,
+            DamageType.Crossvec => ItemType.GunCrossvec,
+            DamageType.Shotgun  => ItemType.GunShotgun,
+            DamageType.AK       => ItemType.GunAK,
+            DamageType.Logicer  => ItemType.GunLogicer,
+            DamageType.E11Sr    => ItemType.GunE11SR,
+            DamageType.Frmg0    => ItemType.GunFRMG0,
+            DamageType.A7       => ItemType.GunA7,
+            _                   => null
+        };
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedicineHudSegment.cs =====
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using Exiled.API.Features;
+
+namespace EventHUD.Medicine
+{
+    /// <summary>
+    /// Строка "Состояние: ..." в карточке игрока.
+    /// Вся вёрстка через voffset, без br.
+    /// </summary>
+    public static class MedicineHudSegment
+    {
+        private const int MaxPerLine = 3;
+
+        /// <summary>
+        /// Строит HUD-сегмент медицины с динамическим voffset.
+        /// </summary>
+        /// <param name="player">Игрок</param>
+        /// <param name="c">Конфиг</param>
+        /// <param name="voffset1">Voffset первой строки</param>
+        /// <param name="voffset2">Voffset второй строки (если нужна)</param>
+        public static string Build(Player player, Config c, float voffset1, float voffset2, out int linesUsed)
+        {
+            if (!MedicalStorage.TryGet(player.UserId, out var state))
+            {
+                linesUsed = 1;
+                return BuildNormal(c, voffset1);
+            }
+
+            if (!state.HasAnything)
+            {
+                linesUsed = 1;
+                return BuildNormal(c, voffset1);
+            }
+
+            // Собираем все элементы для отображения
+            var items = new List<HudItem>();
+
+            // Глобальные состояния (кроме Normal)
+            foreach (var cond in state.Conditions)
+            {
+                if (cond == GlobalCondition.Normal)
+                    continue;
+
+                items.Add(new HudItem
+                {
+                    Priority = cond.GetPriority(),
+                    Text     = $"<color={cond.GetColor()}>{cond.GetShortName()}</color>"
+                });
+            }
+
+            // Локальные травмы
+            foreach (var injury in state.Injuries)
+            {
+                items.Add(new HudItem
+                {
+                    Priority = injury.Type.GetPriority(),
+                    Text     = injury.ToHudString()
+                });
+            }
+
+            // Сортируем по приоритету (самые критичные первые)
+            items.Sort((a, b) => b.Priority.CompareTo(a.Priority));
+
+            if (items.Count == 0)
+            {
+                linesUsed = 1;
+                return BuildNormal(c, voffset1);
+            }
+
+            // ── Строка 1 ──
+            int line1Count = System.Math.Min(items.Count, MaxPerLine);
+            var line1Items = items.Take(line1Count).ToList();
+            int remaining  = items.Count - line1Count;
+
+            var sb = new StringBuilder();
+            sb.Append($"<voffset={voffset1}em><indent={c.MedicineHudIndent}%>");
+            sb.Append($"{c.MedicineHudLabel}: ");
+            sb.Append(string.Join(" | ", line1Items.Select(i => i.Text)));
+
+            // ── Строка 2 — если нужна ──
+            if (remaining > 0)
+            {
+                int line2Count = System.Math.Min(remaining, MaxPerLine);
+                var line2Items = items.Skip(line1Count).Take(line2Count).ToList();
+                int leftover   = items.Count - line1Count - line2Count;
+
+                sb.Append($"<voffset={voffset2}em><indent={c.MedicineHudIndent}%>");
+                sb.Append(string.Join(" | ", line2Items.Select(i => i.Text)));
+
+                if (leftover > 0)
+                    sb.Append($" | <color=#888888>+{leftover}</color>");
+            }
+
+            linesUsed = remaining > 0 ? 2 : 1;
+            return sb.ToString();
+        }
+
+        private static string BuildNormal(Config c, float voffset)
+        {
+            return $"<voffset={voffset}em><indent={c.MedicineHudIndent}%>" +
+                   $"{c.MedicineHudLabel}: <color=#ebffea>Норма</color>";
+        }
+
+        private class HudItem
+        {
+            public int    Priority;
+            public string Text;
+        }
+    }
+}
+ 
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Medicine\MedkitHealService.cs =====
+using System;
+using System.Collections.Generic;
+using CustomPlayerEffects;
+using EventHUD.Hud;
+using Exiled.API.Features;
+using MEC;
+
+namespace EventHUD.Medicine
+{
+    public class MedkitHealService
+    {
+        private readonly Dictionary<string, CoroutineHandle> _healCoroutines = new Dictionary<string, CoroutineHandle>();
+        private readonly Dictionary<string, ushort> _activeKitSerial = new Dictionary<string, ushort>();
+
+        public void StartHealing(Player player)
+        {
+            if (player.CurrentItem == null || player.CurrentItem.Type != ItemType.Medkit) return;
+
+            ushort kitSerial = player.CurrentItem.Serial;
+            var kit = MedkitInventoryStorage.GetOrCreate(kitSerial);
+            if (kit == null) return;
+
+            var medState = MedicalStorage.GetOrCreate(player.UserId);
+            var menuState = MedkitStorage.GetOrCreate(player.UserId);
+            var items = MedkitMenuBuilder.Build(medState, Plugin.Instance.Config, kit, false);
+
+            if (items.Count == 0 || menuState.SelectedIndex >= items.Count) return;
+            var selected = items[menuState.SelectedIndex];
+            if (!selected.CanHeal || selected.Stages.Count == 0 || selected.IsBack) return;
+
+            CancelHealing(player.UserId);
+            menuState.IsHealing = true;
+            menuState.CurrentStage = 0;
+            menuState.HealElapsed = 0;
+            menuState.HealStartedAt = DateTime.UtcNow;
+            menuState.HealingItem = selected;
+
+            _activeKitSerial[player.UserId] = kitSerial;
+
+            if (selected.LocalTarget == LocalInjuryType.Chemical) player.DisableEffect<Concussed>();
+            if (selected.LocalTarget == LocalInjuryType.Burn) player.DisableEffect<Burned>();
+
+            _healCoroutines[player.UserId] = Timing.RunCoroutine(HealCoroutine(player, menuState, medState));
+        }
+
+        public void CancelHealing(string userId)
+        {
+            if (_healCoroutines.TryGetValue(userId, out var handle)) { Timing.KillCoroutines(handle); _healCoroutines.Remove(userId); }
+            _activeKitSerial.Remove(userId);
+            if (MedkitStorage.TryGet(userId, out var menuState)) menuState.Reset();
+        }
+
+        public void ClearAll()
+        {
+            foreach (var handle in _healCoroutines.Values) Timing.KillCoroutines(handle);
+            _healCoroutines.Clear();
+            _activeKitSerial.Clear();
+        }
+
+        private IEnumerator<float> HealCoroutine(Player player, MedkitMenuState menuState, PlayerMedicalState medState)
+        {
+       

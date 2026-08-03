@@ -1,0 +1,553 @@
+                    name = name,
+                    selfDestruct = _current.selfDestruct,
+                    points = _current.points.Select(p => new RecordingPoint
+                    {
+                        x = p.x, y = p.y, z = p.z,
+                        rx = p.rx, ry = p.ry, rz = p.rz,
+                        t = p.t, bomb = p.bomb, explode = p.explode
+                    }).ToList()
+                };
+
+                string path = Path.Combine(RecordingsDir, name + ".json");
+                File.WriteAllText(path, JsonConvert.SerializeObject(rec, Formatting.Indented));
+                _saved[name] = rec;
+                return true;
+            }
+            catch (Exception e)
+            {
+                Log.Warn($"[Bomba] Ошибка сохранения записи: {e.Message}");
+                return false;
+            }
+        }
+
+        // список сохранённых записей
+        public static string ListRecordings()
+        {
+            if (_saved.Count == 0)
+                return "Сохранённых записей нет.";
+
+            var lines = _saved.Values
+                .OrderBy(r => r.name)
+                .Select(r =>
+                {
+                    float dur = r.points.Count > 0 ? r.points[r.points.Count - 1].t : 0f;
+                    return $"{r.name} ({dur:0.0} сек, {r.points.Count} точек)";
+                });
+            return string.Join("\n", lines);
+        }
+
+        // воспроизведение записи по имени или текущей
+        public static bool PlayRecording(Player player, string name)
+        {
+            if (player == null) return false;
+
+            Recording data = null;
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                _saved.TryGetValue(name, out data);
+            }
+            else
+            {
+                data = _current;
+            }
+
+            if (data == null || data.points.Count < 2)
+                return false;
+
+            if (IsRecording)
+                StopRecording();
+
+            if (IsPlaying)
+                StopPlayback();
+
+            _playData = data;
+            _playOwner = player;
+            _playHandle = Timing.RunCoroutine(PlayLoop(player, data));
+            return true;
+        }
+
+        public static void StopPlayback()
+        {
+            if (_playData == null) return;
+
+            Timing.KillCoroutines(_playHandle);
+            if (_playPlaneId > 0)
+                BombaPlane.Delete(_playPlaneId);
+            _playPlaneId = 0;
+            _playData = null;
+            _playOwner = null;
+        }
+
+        // основной цикл воспроизведения
+        private static IEnumerator<float> PlayLoop(Player owner, Recording data)
+        {
+            var points = data.points;
+            float totalTime = points[points.Count - 1].t;
+
+            // спавним самолёт на первой точке
+            RecordingPoint first = points[0];
+            Vector3 startPos = new Vector3(first.x, first.y, first.z);
+            Quaternion startRot = Quaternion.Euler(first.rx, first.ry, first.rz);
+
+            int planeId = BombaPlane.SpawnAt(startPos, startRot);
+            if (planeId == 0)
+            {
+                _playData = null;
+                yield break;
+            }
+            _playPlaneId = planeId;
+            object plane = BombaPlane.GetPlane(planeId);
+
+            // запускаем звук самолёта
+            BombaPlane.StartSoundPublic(planeId);
+
+            float elapsed = 0f;
+            Vector3 prevPos = startPos;
+            Vector3 lastHudPos = startPos;
+
+            while (true)
+            {
+                yield return Timing.WaitForSeconds(0.05f); // 20 тиков в секунду для плавности
+
+                if (_playPlaneId == 0 || _playData == null)
+                    yield break;
+
+                plane = BombaPlane.GetPlane(_playPlaneId);
+                if (plane == null)
+                    yield break;
+
+                elapsed += 0.05f;
+
+                // конец записи - просто удаляем самолёт (без взрыва)
+                if (elapsed >= totalTime)
+                {
+                    BombaPlane.Delete(_playPlaneId);
+                    _playPlaneId = 0;
+                    _playData = null;
+                    yield break;
+                }
+
+                // находим текущий сегмент
+                int idx = FindSegmentIndex(points, elapsed);
+                if (idx < 0 || idx >= points.Count - 1)
+                {
+                    BombaPlane.Delete(_playPlaneId);
+                    _playPlaneId = 0;
+                    _playData = null;
+                    yield break;
+                }
+
+                var p0 = points[idx];
+                var p1 = points[idx + 1];
+                float segLen = Mathf.Max(0.001f, p1.t - p0.t);
+                float frac = Mathf.Clamp01((elapsed - p0.t) / segLen);
+
+                Vector3 pos = Vector3.Lerp(
+                    new Vector3(p0.x, p0.y, p0.z),
+                    new Vector3(p1.x, p1.y, p1.z), frac);
+                Quaternion rot = Quaternion.Slerp(
+                    Quaternion.Euler(p0.rx, p0.ry, p0.rz),
+                    Quaternion.Euler(p1.rx, p1.ry, p1.rz), frac);
+
+                // сброс бомб: пока карточка в руках (bomb=true) - гранаты летят каждые 0.1с
+                if (points[idx].bomb)
+                {
+                    BombaPlane.DropGrenadePublic(plane);
+                }
+
+                // если админ взял гранату в этой точке - самолёт взрывается сразу
+                if (points[idx].explode)
+                {
+                    BombaPlane.ExplodePlanePublic(plane, 40);
+                    _playPlaneId = 0;
+                    _playData = null;
+                    yield break;
+                }
+
+                // движение самолёта (с доворотом на 90 как в Spawn)
+                BombaPlane.SetPlanePosition(plane, pos, rot * Quaternion.Euler(0f, 90f, 0f));
+                prevPos = pos;
+
+                // HUD каждые 0.2с
+                if (elapsed - (lastHudPos.x - 0) > 0.2f)
+                {
+                    lastHudPos.x = elapsed;
+                    bool bombsOn = points[idx].bomb;
+                    string bombText = bombsOn ? "<color=red>вкл</color>" : "<color=green>выкл</color>";
+                    string hud = $"<size=25><color=yellow>Воспроизведение: {elapsed:0.0}/{totalTime:0.0} сек | Бомбы: {bombText}</color></size>";
+                    if (owner != null && owner.IsConnected)
+                    {
+                        owner.ClearBroadcasts();
+                        owner.Broadcast(1, hud);
+                    }
+                }
+            }
+        }
+
+        // поиск индекса сегмента по времени
+        private static int FindSegmentIndex(List<RecordingPoint> points, float time)
+        {
+            for (int i = 0; i < points.Count - 1; i++)
+            {
+                if (time >= points[i].t && time <= points[i + 1].t)
+                    return i;
+            }
+            return points.Count - 2;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\AiPermsCommand.cs =====
+using System;
+using CommandSystem;
+using Exiled.Permissions.Extensions;
+
+namespace EventHUD.Commands
+{
+    [CommandHandler(typeof(RemoteAdminCommandHandler))]
+    [CommandHandler(typeof(GameConsoleCommandHandler))]
+    public class AiPermsCommand : ICommand
+    {
+        public string Command => "aiperms";
+
+        public string[] Aliases => new[] { "aiperm", "aip", "aipermission", "aipermissions" };
+
+        public string Description => "Управление правами ИИ (.ai): safe / adm / fulladm.";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            if (arguments.Count == 0 || arguments.At(0).ToLowerInvariant() == "status")
+            if (!sender.CheckPermission("eventhud.aiperms"))
+            {
+                response = "Недостаточно прав (eventhud.aiperms).";
+                return false;
+            }
+
+            if (arguments.Count == 0 || arguments.At(0).ToLowerInvariant() == "status")
+            {
+                response = "Права ИИ: " + Ai.AiPermissions.Status()
+                    + "\nИспользование: aip <safe|adm|fulladm> <on|off>";
+                return true;
+            }
+
+            if (arguments.Count < 2)
+            {
+                response = "Использование: aip <safe|adm|fulladm> <on|off>";
+                return false;
+            }
+
+            string mode = arguments.At(0).ToLowerInvariant();
+            string state = arguments.At(1).ToLowerInvariant();
+
+            if (state != "on" && state != "off")
+            {
+                response = "Второй аргумент: on или off.";
+                return false;
+            }
+
+            if (!Ai.AiPermissions.Set(mode, state == "on"))
+            {
+                response = "Неизвестный режим. Доступны: safe, adm, fulladm.";
+                return false;
+            }
+
+            response = $"Режим {mode} теперь {state}. " + Ai.AiPermissions.Status();
+            return true;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\BombaCommand.cs =====
+using System;
+using System.Globalization;
+using CommandSystem;
+using Exiled.API.Features;
+using UnityEngine;
+
+namespace EventHUD.Commands
+{
+    [CommandHandler(typeof(RemoteAdminCommandHandler))]
+    public class BombaCommand : ICommand
+    {
+        public string Command => "bomba";
+        public string[] Aliases => Array.Empty<string>();
+        public string Description => "bomba record/play/save/list/spawn";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            if (arguments.Count == 0)
+            {
+                response = "bomba record/play/save/list/spawn";
+                return false;
+            }
+
+            string sub = arguments.At(0).ToLowerInvariant();
+
+            switch (sub)
+            {
+                case "record":
+                case "rec":
+                {
+                    var player = Player.Get(sender);
+                    if (player == null)
+                    {
+                        response = "Команда доступна только игрокам.";
+                        return false;
+                    }
+
+                    // остановка записи
+                    if (arguments.Count >= 2 && arguments.At(1).ToLowerInvariant() == "stop")
+                    {
+                        if (Bomba.BombaRecorder.IsRecording)
+                        {
+                            Bomba.BombaRecorder.StopRecording();
+                            response = "Запись остановлена.";
+                            return true;
+                        }
+                        response = "Запись не идёт.";
+                        return false;
+                    }
+
+                    // если запись уже идёт - останавливаем её
+                    if (Bomba.BombaRecorder.IsRecording)
+                    {
+                        Bomba.BombaRecorder.StopRecording();
+                        response = "Запись остановлена.";
+                        return true;
+                    }
+
+                    float delay = 0f;
+                    if (arguments.Count >= 2)
+                    {
+                        float.TryParse(arguments.At(1), NumberStyles.Float, CultureInfo.InvariantCulture, out delay);
+                        if (delay < 0f) delay = 0f;
+                        if (delay > 30f) delay = 30f;
+                    }
+
+                    bool started = Bomba.BombaRecorder.StartRecording(player, delay);
+                    response = started
+                        ? (delay > 0f
+                            ? $"Запись начнётся через {delay:0} сек."
+                            : "Запись начата. Приземление или bomba record stop остановит запись. Фонарик выкл = бомбы летят.")
+                        : "Не удалось начать запись.";
+                    return started;
+                }
+
+                case "play":
+                {
+                    var player = Player.Get(sender);
+                    if (player == null)
+                    {
+                        response = "Команда доступна только игрокам.";
+                        return false;
+                    }
+
+                    string name = arguments.Count >= 2 ? arguments.At(1) : null;
+
+                    bool ok = Bomba.BombaRecorder.PlayRecording(player, name);
+                    response = ok
+                        ? (string.IsNullOrEmpty(name)
+                            ? "Воспроизведение текущей записи."
+                            : $"Воспроизведение записи '{name}'.")
+                        : "Запись не найдена. Используйте: bomba record, затем bomba save <имя>.";
+                    return ok;
+                }
+
+                case "save":
+                {
+                    string name = arguments.Count >= 2 ? arguments.At(1) : null;
+                    if (string.IsNullOrWhiteSpace(name))
+                    {
+                        response = "Использование: bomba save <имя>";
+                        return false;
+                    }
+
+                    bool ok = Bomba.BombaRecorder.SaveRecording(name);
+                    response = ok ? $"Запись сохранена как '{name}'." : "Нет записи для сохранения.";
+                    return ok;
+                }
+
+                case "list":
+                {
+                    response = Bomba.BombaRecorder.ListRecordings();
+                    return true;
+                }
+
+                case "spawn":
+                {
+                    var player = Player.Get(sender);
+                    if (player == null)
+                    {
+                        response = "Команда доступна только игрокам.";
+                        return false;
+                    }
+
+                    bool bombs = true;
+                    float speed = 0f;
+
+                    if (arguments.Count >= 2)
+                    {
+                        string mode = arguments.At(1).ToLowerInvariant();
+                        if (mode == "safe")
+                            bombs = false;
+                        // auto или любое другое - обычный самолёт
+                    }
+
+                    if (arguments.Count >= 3)
+                    {
+                        if (float.TryParse(arguments.At(2), NumberStyles.Float,
+                            CultureInfo.InvariantCulture, out float ps))
+                        {
+                            speed = Mathf.Clamp(ps, 0f, 500f);
+                        }
+                    }
+
+                    Vector3 dir = player.CameraTransform.forward;
+                    int id = Bomba.BombaPlane.Spawn(player, dir, true, bombs, speed);
+                    if (id == 0)
+                    {
+                        response = "Не удалось создать самолёт.";
+                        return false;
+                    }
+
+                    string modeName = bombs ? "обычный" : "safe";
+                    string speedText = speed > 0f ? $", скорость {speed:0} м/с" : "";
+                    response = $"Самолёт #{id} запущен ({modeName}{speedText}).";
+                    return true;
+                }
+
+                case "delete":
+                {
+                    if (arguments.Count < 2)
+                    {
+                        response = "bomba delete <id> или bomba delete all";
+                        return false;
+                    }
+
+                    string target = arguments.At(1).ToLowerInvariant();
+                    if (target == "all")
+                    {
+                        bool ok = Bomba.BombaPlane.DeleteAll();
+                        response = ok ? "Все самолёты удалены." : "Активных самолётов нет.";
+                        return ok;
+                    }
+
+                    if (int.TryParse(target, out int id))
+                    {
+                        bool ok = Bomba.BombaPlane.Delete(id);
+                        response = ok ? $"Самолёт #{id} удалён." : $"Самолёт #{id} не найден.";
+                        return ok;
+                    }
+
+                    response = "bomba delete <id> или bomba delete all";
+                    return false;
+                }
+
+                default:
+                    response = "bomba record/play/save/list/spawn";
+                    return false;
+            }
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\CallAdminCommand.cs =====
+using System;
+using System.Collections.Generic;
+using CommandSystem;
+using Exiled.API.Features;
+
+namespace EventHUD.Commands
+{
+    [CommandHandler(typeof(ClientCommandHandler))]
+    public class CallAdminCommand : ICommand
+    {
+        private static readonly Dictionary<string, DateTime> _cooldowns = new Dictionary<string, DateTime>();
+        private const double CooldownSeconds = 180.0;
+        private const int MaxReasonLength = 100;
+
+        public string Command => "calladmin";
+        public string[] Aliases => Array.Empty<string>();
+        public string Description => "Пингует администратора в дискорд канале, просьба не абузить.";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            var player = Player.Get(sender);
+            if (player == null)
+            {
+                response = "Команда доступна только игрокам.";
+                return false;
+            }
+
+            if (arguments.Count == 0)
+            {
+                response = "Usage: .calladmin причина";
+                return false;
+            }
+
+            if (_cooldowns.TryGetValue(player.UserId, out var last))
+            {
+                double left = CooldownSeconds - (DateTime.UtcNow - last).TotalSeconds;
+                if (left > 0)
+                {
+                    response = $"Подождите {Math.Ceiling(left)} сек. перед повторным вызовом.";
+                    return false;
+                }
+            }
+
+            string reason = string.Join(" ", arguments);
+            if (reason.Length > MaxReasonLength)
+            {
+                response = $"Причина слишком длинная (макс. {MaxReasonLength} символов).";
+                return false;
+            }
+
+            reason = reason.Replace("|", "/").Replace("\n", " ").Replace("\r", " ").Replace("`", "'");
+            string nickname = player.Nickname.Replace("|", "/").Replace("`", "'");
+
+            // Отправляем напрямую через вебхук
+            DiscordWebhookService.SendCallAlert($"**Вызов Администрации**\n\nВас вызывает `{nickname}` с причиной: `{reason}`");
+
+            _cooldowns[player.UserId] = DateTime.UtcNow;
+            response = "Администрация вызвана. Не абузьте команду.";
+            return true;
+        }
+    }
+}
+
+===== C:\Users\tkanu\Music\SCPSLSERVER\Commands\CallCommand.cs =====
+using System;
+using System.Collections.Generic;
+using CommandSystem;
+using EventHUD.Util;
+using Exiled.API.Features;
+
+namespace EventHUD.Commands
+{
+    [CommandHandler(typeof(ClientCommandHandler))]
+    public class CallCommand : ICommand
+    {
+        private static readonly Dictionary<string, DateTime> _cooldowns = new();
+
+        public string Command => "call";
+        public string[] Aliases => Array.Empty<string>();
+        public string Description => "Отправить запрос администрации";
+
+        public bool Execute(ArraySegment<string> arguments, ICommandSender sender, out string response)
+        {
+            var player = Player.Get(sender);
+            if (player == null)
+            {
+                response = "Команда доступна только игрокам.";
+                return false;
+            }
+
+            if (_cooldowns.TryGetValue(player.UserId, out var lastUse) &&
+                (DateTime.UtcNow - lastUse).TotalSeconds < 5)
+            {
+                response = "Подождите 5 секунд перед повторным использованием.";
+                return false;
+            }
+
+            string reason = arguments.Count > 0
+  
